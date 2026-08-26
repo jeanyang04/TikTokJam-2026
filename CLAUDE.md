@@ -11,17 +11,18 @@ The RrankPyramid/CodeJam starter kit (React UI + Fastify control plane + Codex C
 - **Human JWT** — `{sub:userId, typ:"human"}`, issued by `POST /api/auth/login`, only ever between browser and `/api/*`. Never enters a container.
 - **Agent JWT** — `{sub:agentId, typ:"agent", own:ownerId, run, jti, scp, exp}`, minted per run in `AgentService.sendMessage`, passed to Codex via `-c mcp_servers.launchpad.http_headers`. A *snapshot*.
 - **RunToken** — store row keyed by `jti`: `{scp[], taints[], revokedAt, expiresAt}`. **Authoritative.** Enforcement reads this row, not the JWT claims.
-- **scp** — tool scopes an agent may call: `workspace:read|write`, `crm:read|write`, `webhook:send`.
+- **scp** — tool scopes an agent may call: `workspace:read|write`, `crm:read|write`, `webhook:send`. Tools: `workspace_read`, `workspace_write`, `crm_read`, `crm_write`, `webhook_send` — exactly five.
+- **PolicyGrant** is intra-tenant only (`createGrant` → 400 on owner mismatch).
 - **PolicyGrant** — `{fromOwner, toAgent, resource, actions[], egress[], revokedAt}`: whose *data* an agent may touch and where it may go. Checked on every call.
-- **taints** — labels added to a RunToken when it reads grant-scoped data; outbound tools must satisfy every taint's `egress` (IFC).
-- **Access Request Card** — `ApprovalRequest{source: "live_deny"|"pattern"|"nl_intent", status}`; decisions: `allow_once` (widen `RunToken.scp`), `allow_always` (write PolicyGrant + widen `Agent.permissions.tools`), `deny`.
+- **taints** — labels added to a RunToken when it reads grant-scoped data; outbound tools must satisfy every taint's `egress` (IFC). Egress classes: `internal` (own workspace / own CRM), `agent` (another agent's workspace, same tenant), `external` (`webhook_send`). Taints persist after grant revoke (revoked grant → `egress: []`).
+- **Access Request Card** — `ApprovalRequest{source: "live_deny"|"nl_intent", kind: "scope"|"grant"|"declassify", status}`; buttons **Allow for this run** (widen `RunToken.scp`; grant with run expiry), **Always allow** (write PolicyGrant + widen `Agent.permissions.tools`), **Deny**. No pattern cards.
 - **RunEvent** — audit row: `human → agent → action → resource → outcome`, written on **every** gateway branch, allow and deny, after `redact()`.
-- **LOCK 1** = gateway checks. **LOCK 2** = Postgres RLS on `crm_records` (`owner_id = current_setting('app.owner_id', true) OR live grant`).
+- **LOCK 1** = gateway checks. **LOCK 2** = Postgres RLS on `crm_records`, **owner-only**: `owner_id = current_setting('app.owner_id', true)`. Grants are enforced in the gateway only; `withOwner()` binds `app.owner_id` from the verified token, never from a tool argument.
 
 ## Non-negotiable rules
 1. **Baseline must keep working.** Agent CRUD, Playground, run lifecycle, JSON store. Defaults for new fields = today's behaviour. `npm run check` green on every PR (and it must pass *without* Docker — DB tests are gated on `DATABASE_URL_AGENT`).
 2. **No caching of tokens or grants.** Gateway reads the RunToken row and PolicyGrant on every call. Revoke-mid-run depends on it.
-3. **Cross-tenant = 403 + RunEvent**, never a fake 404. Listing is filtered (absent, not hidden).
+3. **Cross-tenant = 403 + RunEvent** on an existing resource; unknown ID = plain 404. Listing is filtered (absent, not hidden).
 4. **Secrets never enter the container or the logs.** No `ARK_API_KEY` in container env (behind `LLM_PROXY_ENABLED`); everything written to RunEvents passes `redact()`; never commit `.env`.
 5. **Enforcement lives in the backend/data layer, never the UI.** UI only exposes evidence.
 6. **Keep the JSON store** for agents/runs/tokens/grants/events. Postgres holds only the protected resource (`crm_records`).
@@ -45,7 +46,9 @@ The RrankPyramid/CodeJam starter kit (React UI + Fastify control plane + Codex C
 - `npm run check:db` — RLS tests against the compose Postgres
 
 ## Demo scenes (what the code must make true)
-1 deny-by-default → live card → Allow always · 2 prompt-injection exfil blocked by provenance · 3 pattern + NL grant cards · 4 cross-tenant: absent in list, explicit 403 · 5 revoke one grant mid-task, agent keeps working on the rest · 6 audit timeline.
+1 deny-by-default → live card → Always allow → follow-up message succeeds · 2 prompt-injection exfil blocked by provenance (live once, `/demo/replay` fallback) · 3 NL grant card (stretch) · 4 cross-tenant: absent in list, explicit 403 · 5 revoke one grant mid-task, agent keeps working on the rest · 6 audit timeline (filter: policy only / all).
+
+Gateway transport is **MCP streamable HTTP** (verified: codex 0.144.6 sends `-c mcp_servers.*.http_headers`). Approval is never same-turn: tool returns DENIED, human decides, user sends the next message. Revoke = per grant; Kill switch = per agent identity; Stop = kit's process kill. No hosted instance — judges run locally.
 
 ## Cut order if time is short
-NL parse → LLM proxy → IFC fingerprint layer → IFC entirely. Never cut: gateway, grants, cards, 403+audit, grant revoke, timeline, tests.
+NL parse → LLM proxy → IFC fingerprint layer (keep run-level taint). **IFC itself is committed.** Never cut: gateway, grants, cards, 403+audit, grant revoke, taints + egress block, timeline, tests.

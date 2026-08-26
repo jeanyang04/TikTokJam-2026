@@ -1,6 +1,6 @@
 # Agent Launchpad — Architecture Diagrams (Identity & Authorization track)
 
-Agreed terms (2026-08-26): grants as first-class objects · deny-triggered Access Request Card (sources: live_deny / pattern / nl_intent) · explicit 403 + audit on cross-tenant · grant-level revoke (token stays valid) · taint-tracked provenance on outbound tools · RLS backs the DB-held resource.
+Agreed terms (grilled 2026-08-26, see PLAN.md §0): grants as first-class objects (intra-tenant) · deny-triggered Access Request Card (sources: live_deny / nl_intent; buttons Allow for this run / Always allow / Deny) · 403 + audit on cross-tenant, 404 for unknown IDs · grant-level revoke (token stays valid; revoked grant's taint → egress []) · taint-tracked provenance on outbound tools (committed) · **owner-only** RLS on crm_records · MCP transport verified.
 
 Cast: **Jean** owns **Researcher** and **Writer**. **Alex** is a second tenant.
 
@@ -27,7 +27,7 @@ flowchart LR
         OWN["ownership preHandler<br/>owner mismatch → 403 + audit<br/>list → filtered (absent)"]
         SVC["AgentService<br/>mint RunToken{own, scp, taints:[]}"]
         GW["gateway.ts /mcp — LOCK 1<br/>token · scope · grant live · owner · egress/taint · audit"]
-        CARD["Access Request Card<br/>source: live_deny | pattern | nl_intent<br/>Allow once · Allow always · Deny"]
+        CARD["Access Request Card<br/>source: live_deny | nl_intent<br/>Allow for this run · Always allow · Deny"]
         PROXY["llm-proxy.ts /llm<br/>verify agent JWT · swap key"]
         STORE[("JsonStore<br/>agents · runs · runTokens<br/>policyGrants · approvals · runEvents")]
     end
@@ -40,7 +40,7 @@ flowchart LR
 
     subgraph RESOURCES["Protected resources"]
         WS[("Workspaces (files)<br/>workspaces/&lt;agentId&gt;/<br/>owner + grant checked in gateway")]
-        PG[("Postgres crm_records — LOCK 2<br/>RLS: owner_id = app.owner_id<br/>OR live grant to app.agent_id<br/>role app_agent NOBYPASSRLS")]
+        PG[("Postgres crm_records — LOCK 2<br/>RLS owner-only: owner_id = app.owner_id<br/>role app_agent NOBYPASSRLS · unset → 0 rows")]
         HOOK["Mock webhook sink<br/>(external egress)"]
     end
 
@@ -50,14 +50,14 @@ flowchart LR
     RES & WRI -.owned by.- UJ
     AX -.owned by.- UA
     UJ -- "confirm card / revoke grant" --> CARD
-    CARD -- "Allow once → RunToken.scp<br/>Allow always → PolicyGrant" --> STORE
+    CARD -- "Allow for this run → RunToken.scp<br/>Always allow → PolicyGrant" --> STORE
     SVC -- "read/write" --> STORE
     SVC -- "spawn: projected config + agent token<br/>(no Ark key, no human JWT)" --> CRES & CWRI & CAX
 
     CRES & CWRI & CAX -- "tool call + agent token" --> GW
     CRES & CWRI & CAX -- "model call + agent token" --> PROXY
     GW -- "RunToken · PolicyGrant · taints<br/>RunEvent on every decision" --> STORE
-    GW -- "deny → create card (live_deny)<br/>3 denies/10min → card (pattern)" --> CARD
+    GW -- "deny → create card (live_deny)" --> CARD
     PROXY -- "verify · RunEvent" --> STORE
     PROXY -- "Bearer ARK_API_KEY" --> ARK
 
@@ -81,15 +81,15 @@ flowchart LR
 
 | Object | Answers | Lives in | Mutable during a run? |
 |---|---|---|---|
-| `Agent.permissions.tools` → `RunToken.scp` | which **tools** may this agent call | store | yes — "Allow once" widens `scp` |
-| `PolicyGrant{fromOwner, toAgent, resource, actions, egress, revokedAt}` | whose **data** may this agent touch, and where may it go | store | yes — created by "Allow always", killed by revoke |
+| `Agent.permissions.tools` → `RunToken.scp` | which **tools** may this agent call | store | yes — "Allow for this run" widens `scp` |
+| `PolicyGrant{fromOwner, toAgent, resource, actions, egress, revokedAt}` (intra-tenant only) | whose **data** may this agent touch, and where may it go | store | yes — created by "Always allow" (or "for this run" with run expiry), killed by revoke |
 | `RunToken.taints[]` | what grant-scoped data has this run **already read** | store | grows on every grant-gated read |
 
 **Isolation levels**
 
 | Level | Question | Enforced by |
 |---|---|---|
-| Tenant ↔ tenant | Can Alex see or touch Jean's agents/data? | ownership preHandler → **403 + audit**; RLS on `crm_records` (LOCK 2) |
+| Tenant ↔ tenant | Can Alex see or touch Jean's agents/data? | ownership preHandler → **403 + audit** (404 if the ID doesn't exist); owner-only RLS on `crm_records` (LOCK 2) |
 | Agent ↔ agent, same tenant | Can Researcher read Writer's workspace? | `PolicyGrant` checked per call in gateway (LOCK 1) |
 | Data ↔ destination | Can Researcher send what it read from Writer to a webhook? | taint/egress check on outbound tools (LOCK 1, IFC) |
 
@@ -147,8 +147,8 @@ sequenceDiagram
     Note over WS: never touched
 
     UI->>API: GET /api/approvals (human JWT, polling)
-    API-->>UI: card: "Researcher tried to read Writer's workspace — Allow once / Allow always / Deny"
-    Jean->>UI: Allow always
+    API-->>UI: card: "Researcher tried to read Writer's workspace — Allow for this run / Always allow / Deny"
+    Jean->>UI: Always allow
     UI->>API: POST /api/approvals/:id/decide {decision:"allow_always"}
     API->>API: owner of Researcher AND Writer == user-jean ✔
     API->>ST: PolicyGrant{from:Writer, to:Researcher, resource:workspace, actions:[read], egress:[internal]}
@@ -163,7 +163,7 @@ sequenceDiagram
     GW-->>C: file contents
 ```
 
-"Allow once" = only `RunToken.scp` widened for this run; no `PolicyGrant` written. "Deny" = card closed, event logged, nothing changes.
+"Allow for this run" = `RunToken.scp` widened and, for grant cards, a `PolicyGrant` with `expiresAt` = run expiry. "Deny" = card closed, event logged, nothing changes. Approval is never same-turn: the tool returned DENIED; the next message succeeds.
 
 ---
 
@@ -209,18 +209,17 @@ Not a missing permission: Researcher legitimately had `webhook:send`. The block 
 
 ---
 
-## 5. Access Request funnel — three sources, one card, one confirm
+## 5. Access Request funnel — two sources, one card, one confirm
 
 ```mermaid
 flowchart LR
     D["Gateway deny<br/>(scope / grant / IFC)"] -- "source: live_deny" --> CARD
-    P["Pattern detector<br/>≥3 denies same (agent, resource, action)<br/>in 10 min"] -- "source: pattern" --> CARD
     N["NL intent<br/>'let Researcher read Writer's notes but nothing else'<br/>server-side Ark call → JSON schema<br/>zod + ownership re-check<br/>(regex fallback for demo grammar)"] -- "source: nl_intent" --> CARD
 
-    CARD["Access Request Card<br/>status: pending<br/>Allow once · Allow always · Deny"]
+    CARD["Access Request Card<br/>status: pending<br/>Allow for this run · Always allow · Deny"]
 
-    CARD -- "Allow once" --> ONCE["RunToken.scp += scope<br/>(this run only)"]
-    CARD -- "Allow always" --> ALWAYS["PolicyGrant written<br/>+ Agent.permissions.tools += scope"]
+    CARD -- "Allow for this run" --> ONCE["RunToken.scp += scope<br/>+ grant with run expiry"]
+    CARD -- "Always allow" --> ALWAYS["PolicyGrant written<br/>+ Agent.permissions.tools += scope"]
     CARD -- "Deny" --> DENY["card closed<br/>RunEvent deny"]
     ONCE & ALWAYS & DENY --> EV[("RunEvent: human → agent → action → resource → outcome")]
 
@@ -230,7 +229,7 @@ flowchart LR
     style ONCE fill:#e8f5e9,stroke:#2e7d32
 ```
 
-The model (NL path) **proposes**; only a human click **grants**. All three paths are indistinguishable to the enforcement layer.
+The model (NL path, stretch) **proposes**; only a human click **grants**. Both paths are indistinguishable to the enforcement layer.
 
 ---
 
@@ -266,7 +265,7 @@ sequenceDiagram
 
     C->>GW: crm_read {customer:"Acme"} (Alex-1 token)
     GW->>PG: BEGIN · SET LOCAL app.owner_id='user-alex', app.agent_id='alex-1' · SELECT
-    Note over PG: policy: owner_id = 'user-alex' OR live grant to alex-1 → neither
+    Note over PG: owner-only policy: owner_id = 'user-alex' → Jean's rows don't exist for this query
     PG-->>GW: 0 rows — LOCK 2 holds even if LOCK 1 had a bug
     GW->>ST: RunEvent allow, rows:0
     GW-->>C: []
@@ -330,9 +329,9 @@ flowchart TD
     O -- yes --> EG
     O -- no --> G{"PolicyGrant from owner→agent<br/>resource · action · revokedAt null?"}
     G -- no --> E5["403 cross-tenant / no grant<br/>RunEvent deny<br/>→ card(live_deny)"]
-    G -- yes --> EG{"outbound tool?<br/>(webhook_send, cross-workspace write, share)"}
+    G -- yes --> EG{"outbound tool?<br/>(webhook_send = external,<br/>workspace_write to another agent = agent)"}
     EG -- no --> EXEC
-    EG -- yes --> T{"every taint permits<br/>destination class?"}
+    EG -- yes --> T{"every taint permits<br/>destination class?<br/>(internal | agent | external)"}
     T -- no --> E6["403 ifc<br/>RunEvent deny:ifc + origin<br/>→ card(declassify)"]
     T -- yes --> EXEC["Handler"]
     EXEC --> TX["Postgres tools: BEGIN · SET LOCAL app.owner_id, app.agent_id · query as app_agent<br/>Workspace tools: path-jailed FS"]
@@ -340,9 +339,7 @@ flowchart TD
     RLS -- "0 rows / 42501" --> E7["403 rls<br/>RunEvent deny:rls"]
     RLS -- ok --> POST["if grant-gated READ:<br/>taints += label · store fingerprint"]
     POST --> OK["200 result<br/>RunEvent allow"]
-    E4 & E5 --> PAT{"≥3 denies same key / 10 min?"}
-    PAT -- yes --> CARDP["card(pattern)"]
-    E1 & E2 & E3 & E4 & E5 & E6 & E7 & OK & CARDP --> RED["redact() before write"]
+    E1 & E2 & E3 & E4 & E5 & E6 & E7 & OK --> RED["redact() before write"]
     RED --> ST[("RunEvent: human → agent → action → resource → outcome")]
 
     style E1 fill:#ffebee,stroke:#c62828
@@ -365,8 +362,8 @@ stateDiagram-v2
     queued --> running: container spawned
     running --> running: tool allowed — RunEvent allow (grant-gated read adds a taint)
     running --> running: tool denied — RunEvent deny, card(live_deny) created
-    running --> running: card decided — Allow once widens scp / Allow always writes PolicyGrant
-    running --> running: grant revoked — next grant-gated call 403, other tools continue
+    running --> running: card decided — Allow for this run widens scp / Always allow writes PolicyGrant
+    running --> running: grant revoked — next grant-gated call 403, its taint → egress [], other tools continue
     running --> completed: agent_message — token expires naturally
     running --> failed: whole-token revoke — every call 403/401, codex exits
     running --> cancelled: stopAgent() / server restart
@@ -377,7 +374,7 @@ stateDiagram-v2
 
     note right of running
         PolicyGrant lifecycle is independent of the run:
-        created (Allow always / nl_intent confirm) → live → revokedAt set.
+        created (Always allow / nl_intent confirm) → live → revokedAt set.
         Checked on every call, never cached.
     end note
 ```
@@ -427,7 +424,7 @@ flowchart LR
 |---|---|---|
 | 1 Deny-by-default → live card → Allow always | 3, 5 | gateway step S/G → card → `PolicyGrant` |
 | 2 Injection → provenance block | 4, 8 (T) | run-level taint + fingerprint, outbound tools |
-| 3 NL grant + pattern card | 5, 8 (PAT) | same card, same confirm |
+| 3 NL grant card (stretch) | 5 | same card, same confirm |
 | 4 Cross-tenant 403 + RLS | 6 | ownership preHandler (403 + audit), gateway O/G, RLS |
 | 5 Grant revoke mid-task | 7, 9 | `PolicyGrant.revokedAt`, checked per call |
 | 6 Audit + still usable | 8 (ST), 7 (last calls) | every branch writes `human → agent → action → resource → outcome` |
