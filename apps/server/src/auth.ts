@@ -51,11 +51,32 @@ const agentClaims = z.object({
 });
 
 /**
- * Routes that never carry a human JWT: liveness, the login exchange itself, and
- * the machine-to-machine surfaces, which authenticate agent tokens themselves.
+ * Routes under `/api/` that never carry a human JWT: liveness and the login
+ * exchange itself. The machine-to-machine surfaces (`/mcp`, `/llm`, `/gw`,
+ * `/demo`) are outside `/api/` by construction and authenticate agent tokens
+ * themselves, so this gate never sees them.
  */
-const OPEN_PATHS = new Set(["/api/health", "/api/auth", "/api/auth/login"]);
-const MACHINE_PREFIXES = ["/mcp", "/llm", "/gw", "/demo"];
+const OPEN_PATHS = new Set(["/api/health", "/api/auth/login"]);
+
+export interface SeedUser {
+  id: string;
+  name: string;
+}
+
+/** Parses the `SEED_USERS` env format: `id:Display Name` pairs, comma separated. */
+export function parseSeedUsers(raw: string): SeedUser[] {
+  return raw
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0)
+    .map((entry) => {
+      const separator = entry.indexOf(":");
+      const id = (separator === -1 ? entry : entry.slice(0, separator)).trim();
+      const name = (separator === -1 ? entry : entry.slice(separator + 1)).trim();
+      return { id, name: name || id };
+    })
+    .filter((user) => user.id.length > 0);
+}
 
 function secretFor(config: AppConfig): Uint8Array {
   return new TextEncoder().encode(config.jwtSecret);
@@ -94,9 +115,20 @@ export async function signAgent(
 
 /**
  * Verifies a raw JWT and asserts its principal type. Returns null on any
- * failure — bad signature, expiry, malformed claims, or a type mismatch — so
- * callers cannot accidentally treat an agent token as a human one.
+ * failure: bad signature, expiry, malformed claims, or a type mismatch. That
+ * last case is why the type is an argument rather than something read off the
+ * token, so callers cannot accidentally treat an agent token as a human one.
  */
+export async function verifyToken(
+  config: AppConfig,
+  raw: string,
+  typ: "human",
+): Promise<HumanPrincipal | null>;
+export async function verifyToken(
+  config: AppConfig,
+  raw: string,
+  typ: "agent",
+): Promise<AgentPrincipal | null>;
 export async function verifyToken(
   config: AppConfig,
   raw: string,
@@ -146,9 +178,6 @@ function pathnameOf(url: string): string {
 
 function requiresHumanToken(url: string): boolean {
   const pathname = pathnameOf(url);
-  if (MACHINE_PREFIXES.some((prefix) => pathname.startsWith(prefix))) {
-    return false;
-  }
   return pathname.startsWith("/api/") && !OPEN_PATHS.has(pathname);
 }
 
@@ -158,7 +187,9 @@ function requiresHumanToken(url: string): boolean {
  * principal is attached to the request for downstream ownership checks.
  */
 export function registerAuth(app: FastifyInstance, config: AppConfig): void {
-  const seedUsers = new Map(config.seedUsers.map((user) => [user.id, user]));
+  const seedUsers = new Map(
+    parseSeedUsers(config.seedUsers).map((user) => [user.id, user]),
+  );
 
   app.addHook("onRequest", async (request, reply) => {
     if (!requiresHumanToken(request.url)) {
@@ -168,7 +199,7 @@ export function registerAuth(app: FastifyInstance, config: AppConfig): void {
     if (!principal) {
       return reply.code(401).send({ error: "Authentication required" });
     }
-    request.principal = principal as HumanPrincipal;
+    request.principal = principal;
   });
 
   app.post("/api/auth/login", async (request, reply) => {

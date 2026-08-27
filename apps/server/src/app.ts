@@ -49,8 +49,6 @@ export async function createApp(
     service: "volc-agent-launchpad",
   }));
 
-  app.get("/api/auth", async () => ({ required: config.authToken.length > 0 }));
-
   app.get("/api/system", async () => service.systemInfo());
 
   app.get("/api/agents", async () => ({ agents: service.listAgents() }));

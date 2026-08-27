@@ -1,5 +1,12 @@
+import Fastify from "fastify";
 import { describe, expect, it } from "vitest";
-import { signAgent, signHuman, verifyToken } from "./auth.js";
+import {
+  parseSeedUsers,
+  registerAuth,
+  signAgent,
+  signHuman,
+  verifyToken,
+} from "./auth.js";
 import { loadConfig } from "./config.js";
 
 const config = loadConfig({ NODE_ENV: "test" });
@@ -76,13 +83,62 @@ describe("token verification", () => {
 
 describe("seed users", () => {
   it("parses the SEED_USERS pairs into ids and display names", () => {
-    const parsed = loadConfig({
-      NODE_ENV: "test",
-      SEED_USERS: "user-jean:Jean, user-alex:Alex",
-    });
-    expect(parsed.seedUsers).toEqual([
+    expect(parseSeedUsers("user-jean:Jean, user-alex:Alex")).toEqual([
       { id: "user-jean", name: "Jean" },
       { id: "user-alex", name: "Alex" },
     ]);
+  });
+
+  it("falls back to the id when a pair has no display name", () => {
+    expect(parseSeedUsers("user-jean")).toEqual([
+      { id: "user-jean", name: "user-jean" },
+    ]);
+  });
+
+  it("ignores empty entries", () => {
+    expect(parseSeedUsers("user-jean:Jean,, ,")).toEqual([
+      { id: "user-jean", name: "Jean" },
+    ]);
+  });
+});
+
+describe("the human gate", () => {
+  it("attaches the verified principal to the request", async () => {
+    const app = Fastify();
+    registerAuth(app, config);
+    app.get("/api/whoami", async (request) => ({
+      principal: request.principal ?? null,
+    }));
+
+    const token = await signHuman(config, "user-alex");
+    const response = await app.inject({
+      method: "GET",
+      url: "/api/whoami",
+      headers: { authorization: "Bearer " + token },
+    });
+    expect(response.json()).toEqual({
+      principal: { typ: "human", userId: "user-alex" },
+    });
+    await app.close();
+  });
+
+  it("does not gate routes outside /api/", async () => {
+    const app = Fastify();
+    registerAuth(app, config);
+    app.post("/mcp", async () => ({ ok: true }));
+    app.post("/llm/responses", async () => ({ ok: true }));
+    app.post("/gw/workspace_read", async () => ({ ok: true }));
+    app.post("/demo/replay", async () => ({ ok: true }));
+
+    for (const url of [
+      "/mcp",
+      "/llm/responses",
+      "/gw/workspace_read",
+      "/demo/replay",
+    ]) {
+      const response = await app.inject({ method: "POST", url });
+      expect(response.statusCode, url).toBe(200);
+    }
+    await app.close();
   });
 });

@@ -93,7 +93,7 @@ describe("HTTP boundary", () => {
     await app.close();
   });
 
-  it("leaves health and login open, and does not gate machine routes", async () => {
+  it("leaves health open, query string included", async () => {
     const app = await createApp(loadConfig({ NODE_ENV: "test" }), service);
 
     const health = await app.inject({ method: "GET", url: "/api/health" });
@@ -104,9 +104,6 @@ describe("HTTP boundary", () => {
       url: "/api/health?probe=1",
     });
     expect(healthWithQuery.statusCode).toBe(200);
-
-    const machineRoute = await app.inject({ method: "POST", url: "/mcp" });
-    expect(machineRoute.statusCode).not.toBe(401);
     await app.close();
   });
 

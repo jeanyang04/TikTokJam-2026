@@ -72,16 +72,6 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env) {
       );
     }
   }
-  const seedUsers = env.SEED_USERS.split(",")
-    .map((entry) => entry.trim())
-    .filter((entry) => entry.length > 0)
-    .map((entry) => {
-      const separator = entry.indexOf(":");
-      const id = separator === -1 ? entry : entry.slice(0, separator);
-      const name = separator === -1 ? entry : entry.slice(separator + 1);
-      return { id: id.trim(), name: name.trim() || id.trim() };
-    })
-    .filter((user) => user.id.length > 0);
   const defaultContainerUser =
     typeof process.getuid === "function" && typeof process.getgid === "function"
       ? process.getuid() + ":" + process.getgid()
@@ -107,7 +97,7 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env) {
     runtimeInstanceId: env.RUNTIME_INSTANCE_ID,
     authToken,
     jwtSecret: env.JWT_SECRET,
-    seedUsers,
+    seedUsers: env.SEED_USERS,
     arkApiKey: env.ARK_API_KEY?.trim() ?? "",
     arkModel: env.ARK_MODEL?.trim() ?? "",
     arkBaseUrl: env.ARK_BASE_URL.replace(/\/+$/, ""),
