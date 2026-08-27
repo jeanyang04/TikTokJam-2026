@@ -224,11 +224,20 @@ row therefore carries the revoked token's `runId` when the kill interrupted exac
 run, and `null` otherwise. **Zeon:** auditing the revoked branch from the claims would
 attribute it properly, and then this can go back to `null` like every other API row.
 
-**Pending cards are refused as part of the kill.** A card the agent provoked before the
-kill is still in the operator's queue afterwards, and `allow_always` writes straight into
-`permissions.tools` (`approvals.ts:55`) — answering a stale card would resurrect the
-identity that was killed. `killAgent` denies them through `decideApproval`, so each lands
-in the audit trail as the decision it now is, and a late click gets the 409.
+**Pending cards are refused as part of the kill, and `docs/API.md`'s kill row does not say
+so** — the second deviation, after `tempScopes`. A card the agent provoked before the kill
+is still in the operator's queue afterwards, and `allow_always` writes straight into
+`permissions.tools` (`approvals.ts:55`), so answering a stale card would undo a kill the
+operator had just performed without them connecting the two. `killAgent` denies them
+through `decideApproval`; each lands in the trail as the decision it now is, and a late
+click gets the 409. **F:** a kill empties this agent's card list.
+
+**What that does not do is tombstone the agent.** The killed token cannot mint a new card —
+`gateway.ts` checks `revokedAt` in `authenticate`, before any tool dispatch, so a revoked
+identity never reaches the branch that writes one. A *new* card needs a new run, which needs
+the operator to send another message: a fresh decision, not a resurrection. If a killed
+agent should stay dead until explicitly revived, that is a durable marker on the agent and
+it belongs with `approvals.ts` — **Zeon's call**, not something to bolt onto this route.
 
 **No busy guard, unlike PATCH.** A `409` here would mean the kill switch stops working
 exactly when it is needed. The container is left running; Stop is what kills the process

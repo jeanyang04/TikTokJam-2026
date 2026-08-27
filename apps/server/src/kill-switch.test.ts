@@ -155,16 +155,21 @@ describe("Kill switch", () => {
 
   it("names no run when the kill did not interrupt exactly one", async () => {
     const { app, service, store, as } = await makeHarness();
-    const agent = await service.createAgent({ name: "Researcher" }, "user-jean");
-    await seedToken(store, agent);
-    await seedToken(store, agent);
+    const jean = await as("user-jean");
+    const idle = await service.createAgent({ name: "Idle" }, "user-jean");
+    const twoRuns = await service.createAgent({ name: "Researcher" }, "user-jean");
+    await seedToken(store, twoRuns);
+    await seedToken(store, twoRuns);
+
+    // The common case: an idle agent, killed pre-emptively. Nothing to interrupt.
+    await app.inject({ method: "POST", url: "/api/agents/" + idle.id + "/kill", headers: jean });
+    expect(store.snapshot().runEvents.at(-1)).toMatchObject({ action: "kill", runId: null });
 
     await app.inject({
       method: "POST",
-      url: "/api/agents/" + agent.id + "/kill",
-      headers: await as("user-jean"),
+      url: "/api/agents/" + twoRuns.id + "/kill",
+      headers: jean,
     });
-
     expect(store.snapshot().runEvents.at(-1)).toMatchObject({ action: "kill", runId: null });
     await app.close();
   });
