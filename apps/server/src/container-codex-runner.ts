@@ -1,7 +1,11 @@
 import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { promisify } from "node:util";
 import type { AppConfig } from "./config.js";
-import { buildCodexArgs, parseCodexEventLine } from "./codex-runner.js";
+import {
+  buildCodexArgs,
+  parseCodexEventLine,
+  type CodexTraceEvent,
+} from "./codex-runner.js";
 import { RunCancelledError } from "./errors.js";
 import type {
   AgentRunner,
@@ -56,6 +60,8 @@ export function buildContainerRunArgs(
     ...(engineName === "podman" ? ["--userns", "keep-id"] : []),
     "--network",
     "bridge",
+    "--add-host",
+    "host.docker.internal:host-gateway",
     "--security-opt",
     "no-new-privileges",
     "--cap-drop",
@@ -69,7 +75,7 @@ export function buildContainerRunArgs(
     "--user",
     config.containerUser,
     "--env",
-    "ARK_API_KEY",
+    config.llmProxyEnabled ? "AGENT_TOKEN" : "ARK_API_KEY",
     "--env",
     "CODEX_HOME=/codex-home",
     "--env",
@@ -84,7 +90,12 @@ export function buildContainerRunArgs(
     "/workspace",
     config.containerRuntimeImage,
     "codex",
-    ...buildCodexArgs(request, config.codexSandboxMode, "/workspace"),
+    ...buildCodexArgs(
+      request,
+      config.codexSandboxMode,
+      config.gatewayUrl,
+      "/workspace",
+    ),
   ];
 }
 
@@ -147,7 +158,7 @@ export class ContainerCodexRunner implements AgentRunner {
       buildContainerRunArgs(request, this.config),
       {
         cwd: request.workspacePath,
-        env: this.childEnvironment(),
+        env: this.childEnvironment(request.token),
         stdio: ["ignore", "pipe", "pipe"],
       },
     );
@@ -172,6 +183,22 @@ export class ContainerCodexRunner implements AgentRunner {
       usage: null,
       errors: [],
     };
+    const emitTrace = (event: CodexTraceEvent) => {
+      try {
+        request.onEvent?.({
+          runId: null,
+          agentId: request.agentId,
+          kind: event.kind,
+          action: event.action,
+          resource: event.resource,
+          decision: null,
+          reason: null,
+          detail: event.detail,
+        });
+      } catch {
+        // Trace persistence must never break the Codex run.
+      }
+    };
     let stdout = "";
     let stderr = "";
     let totalBytes = 0;
@@ -187,7 +214,7 @@ export class ContainerCodexRunner implements AgentRunner {
         stdout += chunk.toString("utf8");
         const lines = stdout.split(/\r?\n/);
         stdout = lines.pop() ?? "";
-        for (const line of lines) parseCodexEventLine(line, parsed);
+        for (const line of lines) parseCodexEventLine(line, parsed, emitTrace);
       } else {
         stderr += chunk.toString("utf8");
         if (stderr.length > 16_384) stderr = stderr.slice(-16_384);
@@ -208,7 +235,7 @@ export class ContainerCodexRunner implements AgentRunner {
         child.once("error", reject);
         child.once("close", (code) => resolve(code ?? 1));
       });
-      if (stdout.trim()) parseCodexEventLine(stdout.trim(), parsed);
+      if (stdout.trim()) parseCodexEventLine(stdout.trim(), parsed, emitTrace);
       if (active.cancelled) throw new RunCancelledError();
       if (active.timedOut) {
         throw new Error("Runtime timed out after " + this.config.codexTimeoutMs + " ms");
@@ -235,10 +262,14 @@ export class ContainerCodexRunner implements AgentRunner {
     }
   }
 
-  private childEnvironment(): NodeJS.ProcessEnv {
+  private childEnvironment(token?: string): NodeJS.ProcessEnv {
     const environment: NodeJS.ProcessEnv = {
-      ARK_API_KEY: this.config.arkApiKey,
       NO_COLOR: "1",
+      ...(this.config.llmProxyEnabled
+        ? token
+          ? { AGENT_TOKEN: token }
+          : {}
+        : { ARK_API_KEY: this.config.arkApiKey }),
     };
     for (const name of [
       "PATH",

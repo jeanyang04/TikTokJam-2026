@@ -17,6 +17,8 @@ describe("Container Codex runner", () => {
       CONTAINER_RUNTIME_IMAGE: "runtime:test",
       CONTAINER_USER: "501:20",
       RUNTIME_INSTANCE_ID: "test-instance",
+      LLM_PROXY_ENABLED: "true",
+      GATEWAY_URL: "http://host.docker.internal:3000",
     });
     const args = buildContainerRunArgs(
       {
@@ -24,6 +26,13 @@ describe("Container Codex runner", () => {
         workspacePath: "/tmp/agent-workspace",
         prompt: "write a small program",
         threadId: null,
+        token: "agent.jwt.token",
+        permissions: {
+          sandbox: "read-only",
+          network: false,
+          webSearch: false,
+          tools: ["workspace:read"],
+        },
       },
       config,
     );
@@ -35,11 +44,20 @@ describe("Container Codex runner", () => {
     expect(args).toContain("type=bind,src=/tmp/agent-workspace,dst=/workspace");
     expect(args).toContain("type=bind,src=/tmp/codex-home,dst=/codex-home");
     expect(args).toContain("501:20");
-    expect(args).toContain("workspace-write");
+    expect(args).toContain("read-only");
     expect(args).toContain("/workspace");
     expect(args).toContain("io.codejam.instance-id=test-instance");
     expect(args).toContain("keep-id");
+    expect(args).toContain("host.docker.internal:host-gateway");
+    expect(args).toContain("AGENT_TOKEN");
+    expect(args).not.toContain("ARK_API_KEY");
     expect(args).not.toContain("secret-that-must-not-appear-in-argv");
+    expect(args.join(" ")).toContain("Bearer agent.jwt.token");
+    expect(args.join(" ")).toContain('enabled_tools=[\"workspace_read\"]');
+    const enabledTools = args.find((arg) =>
+      arg.startsWith("mcp_servers.launchpad.enabled_tools="),
+    );
+    expect(enabledTools).not.toContain('"workspace_write"');
   });
 
   it("resumes a thread inside the mounted Runtime workspace", () => {

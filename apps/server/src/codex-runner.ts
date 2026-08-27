@@ -8,6 +8,7 @@ import type {
   RunUsage,
   RunnerRequest,
   RunnerResult,
+  Scope,
 } from "./types.js";
 
 const execFileAsync = promisify(execFile);
@@ -19,20 +20,84 @@ export interface ParsedEvents {
   errors: string[];
 }
 
+const SCOPE_TO_TOOL: Record<Scope, string> = {
+  "workspace:read": "workspace_read",
+  "workspace:write": "workspace_write",
+  "crm:read": "crm_read",
+  "crm:write": "crm_write",
+  "webhook:send": "webhook_send",
+};
+
+function tomlString(value: string): string {
+  return JSON.stringify(value);
+}
+
+function tomlStringArray(values: string[]): string {
+  return "[" + values.map(tomlString).join(",") + "]";
+}
+
+const SANDBOX_RANK: Record<AppConfig["codexSandboxMode"], number> = {
+  "read-only": 0,
+  "workspace-write": 1,
+  "danger-full-access": 2,
+};
+
+function effectiveSandboxMode(
+  configured: AppConfig["codexSandboxMode"],
+  requested: RunnerRequest["permissions"],
+): AppConfig["codexSandboxMode"] {
+  if (!requested) return configured;
+  return SANDBOX_RANK[requested.sandbox] <= SANDBOX_RANK[configured]
+    ? requested.sandbox
+    : configured;
+}
+
 export function buildCodexArgs(
   request: RunnerRequest,
   sandboxMode: AppConfig["codexSandboxMode"],
+  gatewayUrl: string,
   workspacePath = request.workspacePath,
 ): string[] {
+  // The process-wide setting is a ceiling. In particular, migrated agents
+  // default to workspace-write and must not widen an operator's read-only runtime.
+  const effectiveSandbox = effectiveSandboxMode(sandboxMode, request.permissions);
   const args = [
     "exec",
     "--json",
     "--sandbox",
-    sandboxMode,
+    effectiveSandbox,
     "--skip-git-repo-check",
     "-C",
     workspacePath,
   ];
+
+  if (request.permissions) {
+    args.push(
+      "-c",
+      "sandbox_mode=" + tomlString(effectiveSandbox),
+      "-c",
+      "sandbox_workspace_write.network_access=" + request.permissions.network,
+      "-c",
+      "web_search=" + tomlString(request.permissions.webSearch ? "live" : "disabled"),
+    );
+  }
+
+  if (request.token) {
+    const enabledTools = (request.permissions?.tools ?? []).map(
+      (scope) => SCOPE_TO_TOOL[scope],
+    );
+    args.push(
+      "-c",
+      "mcp_servers.launchpad.url=" + tomlString(gatewayUrl.replace(/\/+$/, "") + "/mcp"),
+      "-c",
+      "mcp_servers.launchpad.http_headers={Authorization=" +
+        tomlString("Bearer " + request.token) +
+        "}",
+      "-c",
+      "mcp_servers.launchpad.enabled_tools=" + tomlStringArray(enabledTools),
+    );
+  }
+
   if (request.threadId) {
     args.push("resume", request.threadId, request.prompt);
   } else {
@@ -41,7 +106,67 @@ export function buildCodexArgs(
   return args;
 }
 
-export function parseCodexEventLine(line: string, parsed: ParsedEvents): void {
+export interface CodexTraceEvent {
+  kind: "command" | "file_change" | "mcp_call";
+  action: string;
+  resource: string;
+  detail: Record<string, unknown>;
+}
+
+function traceItem(item: Record<string, unknown>): CodexTraceEvent | null {
+  if (item.type === "command_execution") {
+    return {
+      kind: "command",
+      action: "execute",
+      resource: typeof item.command === "string" ? item.command : "command",
+      detail: {
+        command: typeof item.command === "string" ? item.command : "",
+        status: typeof item.status === "string" ? item.status : null,
+        exitCode: typeof item.exit_code === "number" ? item.exit_code : null,
+      },
+    };
+  }
+  if (item.type === "file_change") {
+    const changes = Array.isArray(item.changes)
+      ? item.changes.map((change) => {
+          if (!change || typeof change !== "object") return { path: "", kind: null };
+          const value = change as Record<string, unknown>;
+          return {
+            path: typeof value.path === "string" ? value.path : "",
+            kind: typeof value.kind === "string" ? value.kind : null,
+          };
+        })
+      : [];
+    return {
+      kind: "file_change",
+      action: "change",
+      resource: changes.map((change) => change.path).filter(Boolean).join(", ") || "workspace",
+      detail: { changes, status: typeof item.status === "string" ? item.status : null },
+    };
+  }
+  if (item.type === "mcp_tool_call") {
+    const server = typeof item.server === "string" ? item.server : "unknown";
+    const tool = typeof item.tool === "string" ? item.tool : "unknown";
+    return {
+      kind: "mcp_call",
+      action: tool,
+      resource: server,
+      detail: {
+        server,
+        tool,
+        status: typeof item.status === "string" ? item.status : null,
+        hasError: item.error !== undefined && item.error !== null,
+      },
+    };
+  }
+  return null;
+}
+
+export function parseCodexEventLine(
+  line: string,
+  parsed: ParsedEvents,
+  onEvent?: (event: CodexTraceEvent) => void,
+): void {
   let event: Record<string, unknown>;
   try {
     event = JSON.parse(line) as Record<string, unknown>;
@@ -58,6 +183,8 @@ export function parseCodexEventLine(line: string, parsed: ParsedEvents): void {
     if (item.type === "agent_message" && typeof item.text === "string") {
       parsed.messages.push(item.text);
     }
+    const trace = traceItem(item);
+    if (trace) onEvent?.(trace);
   }
 
   if (event.type === "turn.completed" && event.usage && typeof event.usage === "object") {
@@ -129,10 +256,14 @@ export class CodexRunner implements AgentRunner {
       throw new Error("Agent already has an active Codex process");
     }
 
-    const args = buildCodexArgs(request, this.config.codexSandboxMode);
+    const args = buildCodexArgs(
+      request,
+      this.config.codexSandboxMode,
+      this.config.gatewayUrl,
+    );
     const child = spawn(this.config.codexBin, args, {
       cwd: request.workspacePath,
-      env: this.childEnvironment(),
+      env: this.childEnvironment(request.token),
       stdio: ["ignore", "pipe", "pipe"],
     });
     const settled = new Promise<void>((resolve) => {
@@ -155,6 +286,22 @@ export class CodexRunner implements AgentRunner {
       usage: null,
       errors: [],
     };
+    const emitTrace = (event: CodexTraceEvent) => {
+      try {
+        request.onEvent?.({
+          runId: null,
+          agentId: request.agentId,
+          kind: event.kind,
+          action: event.action,
+          resource: event.resource,
+          decision: null,
+          reason: null,
+          detail: event.detail,
+        });
+      } catch {
+        // Trace persistence must never break the Codex run.
+      }
+    };
     let stdout = "";
     let stderr = "";
     let totalBytes = 0;
@@ -171,7 +318,7 @@ export class CodexRunner implements AgentRunner {
         const lines = stdout.split(/\r?\n/);
         stdout = lines.pop() ?? "";
         for (const line of lines) {
-          parseCodexEventLine(line, parsed);
+          parseCodexEventLine(line, parsed, emitTrace);
         }
       } else {
         stderr += chunk.toString("utf8");
@@ -196,7 +343,7 @@ export class CodexRunner implements AgentRunner {
         child.once("close", (code) => resolve(code ?? 1));
       });
       if (stdout.trim()) {
-        parseCodexEventLine(stdout.trim(), parsed);
+        parseCodexEventLine(stdout.trim(), parsed, emitTrace);
       }
       if (active.cancelled) {
         throw new RunCancelledError();
@@ -239,7 +386,7 @@ export class CodexRunner implements AgentRunner {
     }
   }
 
-  private childEnvironment(): NodeJS.ProcessEnv {
+  private childEnvironment(token?: string): NodeJS.ProcessEnv {
     const inheritedNames = [
       "PATH",
       "HOME",
@@ -256,8 +403,12 @@ export class CodexRunner implements AgentRunner {
     ] as const;
     const environment: NodeJS.ProcessEnv = {
       CODEX_HOME: this.config.codexHome,
-      ARK_API_KEY: this.config.arkApiKey,
       NO_COLOR: "1",
+      ...(this.config.llmProxyEnabled
+        ? token
+          ? { AGENT_TOKEN: token }
+          : {}
+        : { ARK_API_KEY: this.config.arkApiKey }),
     };
     for (const name of inheritedNames) {
       if (process.env[name] !== undefined) environment[name] = process.env[name];
