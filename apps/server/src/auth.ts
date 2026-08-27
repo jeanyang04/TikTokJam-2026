@@ -51,12 +51,18 @@ const agentClaims = z.object({
 });
 
 /**
- * Routes under `/api/` that never carry a human JWT: liveness and the login
- * exchange itself. The machine-to-machine surfaces (`/mcp`, `/llm`, `/gw`,
- * `/demo`) are outside `/api/` by construction and authenticate agent tokens
- * themselves, so this gate never sees them.
+ * Routes under `/api/` that never carry a human JWT: liveness, the pre-login
+ * capability probe, and the login exchange itself. The machine-to-machine
+ * surfaces (`/mcp`, `/llm`, `/gw`, `/demo`) are outside `/api/` by
+ * construction and authenticate agent tokens themselves, so this gate never
+ * sees them.
+ *
+ * PLAN.md §2 lists this set without `/api/auth`, but that list was written
+ * before anyone checked which routes exist: the baseline UI probes `/api/auth`
+ * at boot and hangs on its loading screen if the probe fails, so gating it
+ * breaks the running app.
  */
-const OPEN_PATHS = new Set(["/api/health", "/api/auth/login"]);
+const OPEN_PATHS = new Set(["/api/health", "/api/auth", "/api/auth/login"]);
 
 export interface SeedUser {
   id: string;

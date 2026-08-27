@@ -93,6 +93,14 @@ describe("HTTP boundary", () => {
     await app.close();
   });
 
+  it("leaves the boot probe open and reports that auth is required", async () => {
+    const app = await createApp(loadConfig({ NODE_ENV: "test" }), service);
+    const probe = await app.inject({ method: "GET", url: "/api/auth" });
+    expect(probe.statusCode).toBe(200);
+    expect(probe.json()).toEqual({ required: true });
+    await app.close();
+  });
+
   it("leaves health open, query string included", async () => {
     const app = await createApp(loadConfig({ NODE_ENV: "test" }), service);
 

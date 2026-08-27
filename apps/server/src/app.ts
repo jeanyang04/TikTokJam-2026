@@ -49,6 +49,12 @@ export async function createApp(
     service: "volc-agent-launchpad",
   }));
 
+  // Kept for the baseline UI's boot probe (apps/web/src/api.ts), which strands
+  // on its loading screen if this 401s or 404s. Now reports the JWT gate, which
+  // is always on: the token it asks for is a human JWT from /api/auth/login
+  // until F replaces this screen with the login bar.
+  app.get("/api/auth", async () => ({ required: true }));
+
   app.get("/api/system", async () => service.systemInfo());
 
   app.get("/api/agents", async () => ({ agents: service.listAgents() }));
