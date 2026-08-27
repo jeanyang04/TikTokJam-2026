@@ -4,7 +4,7 @@
 
 **Blocked by:** 01 (Human login + JWT gate — needs `signAgent`), 02 (Store v2 migration — needs `RunToken`/`Agent` types and store collections).
 
-**Status:** done (commit `d86d978`)
+**Status:** done (commits `d86d978`, `b669ea1`)
 
 - [x] Inside `agent-service.ts:157`'s existing `store.mutate` (around L185): mint `RunToken{jti, runId, agentId, ownerId, scp:[...permissions.tools], taints:[], expiresAt}`
 - [x] Agent JWT `{sub:agentId, typ:"agent", own:ownerId, run:runId, jti, scp, exp}` signed and passed into `executeRun`/`runner.run()`
@@ -20,3 +20,12 @@ is Scene 1. `docs/SEAMS.md` line 75 calls for the same thing.
 tools, because B2's `codex-runner.ts:86` builds Codex's `enabled_tools` from it. Without that,
 a just-widened scope is enforceable at the gateway but invisible to the model, so the agent
 never tries the tool it was just allowed. Recorded in `docs/SEAMS.md`.
+
+**Added beyond the checklist.** The row is revoked when the run ends, on both the success and
+the failure path. Without it a cancelled or failed run left a usable identity behind for the
+rest of `CODEX_TIMEOUT_MS`. `run-identity.test.ts` proves the join the checklist stops short
+of: the minted token reaching the real gateway plugin, allowed in scope, denied out of scope
+with an audited reason, and refused once revoked or once the run ends.
+
+**Note for ticket 07.** `closeRunToken` skips rows that already carry a `revokedAt`, so a kill
+switch timestamp is not overwritten when the run it interrupted unwinds.
