@@ -200,6 +200,11 @@ export async function createApp(
     return { agent: await service.stopAgent(id) };
   });
 
+  app.post("/api/agents/:id/kill", async (request) => {
+    const { id } = agentIdParams.parse(request.params);
+    return { agent: await service.killAgent(id, callerOf(request)) };
+  });
+
   app.get("/api/agents/:id/messages", async (request) => {
     const { id } = agentIdParams.parse(request.params);
     return { messages: service.getMessages(id) };

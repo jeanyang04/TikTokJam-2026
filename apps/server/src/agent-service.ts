@@ -295,6 +295,56 @@ export class AgentService {
   }
 
   /**
+   * The Kill switch: end this agent's identity, everywhere, now. Every live
+   * RunToken is revoked and the tool scopes are emptied, so a call in flight is
+   * refused on its next hop (the gateway re-reads the row) and no later run can
+   * mint the scopes back.
+   *
+   * **`tempScopes` goes with `permissions.tools`.** `docs/API.md` §Agents names
+   * only `tools`, but `RunToken.scp` is `effectiveScopes(agent)` = tools ∪ live
+   * tempScopes, so leaving an "Allow for this run" scope behind would hand it
+   * straight back to the next run. Killing one of the two is not killing.
+   *
+   * Runs regardless of status: a PATCH mid-run is an edit that can wait, a kill
+   * cannot. The container is left alone — Stop is what kills the process.
+   */
+  async killAgent(agentId: string, byOwner: string): Promise<Agent> {
+    const killed = await this.store.mutate((database) => {
+      const agent = database.agents.find((item) => item.id === agentId);
+      if (!agent) {
+        throw new HttpError(404, "Agent not found");
+      }
+      const timestamp = now();
+      for (const token of database.runTokens) {
+        // An already-revoked row keeps its own timestamp: when the identity died
+        // is evidence, and a second kill should not rewrite the first one.
+        if (token.agentId === agentId && !token.revokedAt) {
+          token.revokedAt = timestamp;
+        }
+      }
+      agent.permissions = { ...agent.permissions, tools: [] };
+      agent.tempScopes = [];
+      agent.updatedAt = timestamp;
+      return structuredClone(agent);
+    });
+    await recordEvent(this.store, {
+      // `runId` stays null like every other API row: the operator's click is not
+      // part of a run. The run timeline gets its evidence from the gateway, which
+      // logs the refused call itself with reason `revoked`.
+      runId: null,
+      agentId,
+      ownerId: byOwner,
+      kind: "gateway",
+      action: "kill",
+      resource: "agent/" + agentId,
+      decision: "deny",
+      reason: "revoked-by-operator",
+      detail: {},
+    });
+    return killed;
+  }
+
+  /**
    * Grants and cards go through here rather than through `app.ts` directly, so
    * every store read in the control plane has one door. The policy itself lives
    * in `grants.ts` / `approvals.ts` (Zeon's) and is only called from here.

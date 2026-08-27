@@ -197,3 +197,30 @@ create reaches for an agent, a refused revoke for a grant.
 `command, file_change, mcp_call, llm`. Both are ordered oldest-first by `at`.
 `GET /api/agents/:id/events` takes `limit` (default 200) and keeps the **newest** rows when
 it bites, still in `at` order.
+
+---
+
+## The Kill switch (`agent-service.ts`, B1's file)
+
+**Landed (B1, ticket 07):** `POST /api/agents/:id/kill` → `AgentService.killAgent`. Every
+live `RunToken` for the agent gets `revokedAt`, `permissions.tools` is emptied, `200
+{agent}`.
+
+**It clears `tempScopes` as well, and `docs/API.md` §Agents says only `tools`.** A
+deliberate deviation, because `RunToken.scp` is `effectiveScopes(agent)` = tools ∪ live
+tempScopes: leaving an "Allow for this run" scope behind would hand it back to the very
+next run and the kill would not be a kill. **Zeon:** the contract line wants the extra
+clause; flagging rather than editing `API.md`.
+
+**A kill mid-run is refused by `gateway.ts:95`,** which reads `revokedAt` off the row on
+every call and answers `403 revoked`. That is where the run timeline's evidence comes from,
+so `killAgent`'s own row carries `runId: null` like every other API row — the operator's
+click is not part of a run.
+
+**No busy guard, unlike PATCH.** A `409` here would mean the kill switch stops working
+exactly when it is needed. The container is left running; Stop is what kills the process
+(**B2:** the run's own clean exit as `failed` is your Day 3 item).
+
+**An already-revoked token keeps its first timestamp.** When an identity died is evidence,
+and a second kill must not rewrite the first one. `closeRunToken` at run end has the same
+rule, from the other side.
