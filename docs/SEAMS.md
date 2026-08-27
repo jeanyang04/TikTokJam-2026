@@ -99,3 +99,63 @@ visible to the model. If you need the agent's permanent tools, read the agent.
 `expiresAt` (`CODEX_TIMEOUT_MS + 60s`). Revoking mid-run means setting `revokedAt` on the
 row — the JWT stays valid-looking and the gateway rejects it anyway, because it re-reads
 the row on every call. Ticket 07's kill switch works the same way.
+
+---
+
+## Ownership enforcement (`app.ts`, B1's file)
+
+**Landed (B1, ticket 03):** a `preHandler` on the root instance guards every route under
+`/api/agents/` and `/api/runs/`, per `docs/API.md` §Ownership. It matches on the
+**collection prefix** of `request.routeOptions.url`, not on `:id`, and returns early for
+anything else, so the gateway's `/mcp` and the proxy's `/llm` are untouched.
+
+**Ticket 06: `/api/grants/` and `/api/approvals/` are the two rows still missing** from
+`ownershipChecks` in `app.ts` — add them there rather than checking ownership inside your
+handlers.
+
+**It fails closed on the case that would otherwise slip through.** Matching the prefix
+rather than `:id` means a route named `/api/agents/:agentId/grants` still enters the gate;
+finding no `id` param, it throws 500 rather than waving the request past unchecked. So
+**name the parameter `:id`**. A malformed (non-uuid) id falls through to the route's own
+zod parse, which answers 400. Both branches are pinned by tests.
+
+**404 and 403 mean different things, on purpose.** An id that does not exist is a plain 404
+and writes **no** RunEvent — logging it would make the audit trail an oracle for probing
+which ids are real. An agent that exists but belongs to another tenant is 403 **and** a
+RunEvent. A malformed (non-uuid) id falls through to the route's own zod parse and stays a
+400.
+
+**The deny row shape is fixed by `docs/API.md` §Ownership**, not invented here:
+`{kind:"gateway", action:"api:<METHOD>", resource:"agent/<id>", decision:"deny",
+reason:"cross-tenant"}`, with `resource: "run/<id>"` for the runs route by the same
+pattern. `ownerId` is the *caller*, matching `gateway.ts` — read `ownerId` and `resource`
+as "who tried" and "what they reached for". **F** renders `resource` verbatim in the
+timeline row, so don't reformat it.
+
+**`runId` is `null`** on these rows: an API call is not part of a run. **Ticket 06:**
+`GET /api/runs/:id/events` filters by `runId`, so cross-tenant denials will not appear in a
+run timeline. Decide there whether the timeline needs a second query by `ownerId`.
+
+**`listAgents(ownerId)` takes the owner as a required argument.** Not optional, not
+defaulted — an optional filter on a tenant boundary is one forgotten argument away from
+listing everybody's agents. `createAgent(input, ownerId)` still defaults to `"user-jean"`
+for the service's own tests; `app.ts` always passes `request.principal.userId`.
+
+**`POST /api/agents` and `PATCH /api/agents/:id` both accept `permissions`,** per
+`docs/API.md` §"permissions". `updateAgent` merges it over the agent's current permissions
+inside the existing `store.mutate`; the busy→409 guard that was already there covers the
+contract's "PATCH with permissions while busy → 409".
+
+**Two writers to `Agent.permissions.tools`, and ticket 06 adds no third.** An owner's PATCH
+is the human configuring their own agent; `allow_always` is the human answering an Access
+Request Card the agent provoked. Different triggers, same field, both through
+`AgentService`. The card flow mediates *agent-initiated* escalation — it was never meant to
+stop an owner editing their own agent, so PATCH is not a bypass of it.
+
+**Keys explicitly set to `undefined` are stripped from the permissions body** before it
+reaches `createAgent`, because the service spreads it over `DEFAULT_PERMISSIONS` and
+`{...DEFAULT_PERMISSIONS, sandbox: undefined}` would leave the agent with no sandbox.
+
+**`/api/runs/:id` is checked by the same hook**, resolving the run's agent and then its
+owner. `docs/API.md` §Ownership names it in the preHandler list; ticket 03's checklist is
+merely silent about it.

@@ -1,24 +1,45 @@
 import cors from "@fastify/cors";
 import fastifyStatic from "@fastify/static";
-import Fastify, { type FastifyInstance } from "fastify";
+import Fastify, { type FastifyInstance, type FastifyRequest } from "fastify";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import { registerAuth } from "./auth.js";
 import type { AppConfig } from "./config.js";
 import { HttpError } from "./errors.js";
+import { SCOPES, type AgentPermissions, type Scope } from "./types.js";
 import type { AgentService } from "./agent-service.js";
 
 const agentIdParams = z.object({ id: z.string().uuid() });
 const runIdParams = z.object({ id: z.string().uuid() });
-const createAgentBody = z.object({
+/**
+ * Absent keys fall back to `DEFAULT_PERMISSIONS`, so an explicitly-undefined one
+ * has to be dropped rather than spread: `{...DEFAULT_PERMISSIONS, sandbox:
+ * undefined}` would leave the agent with no sandbox at all.
+ */
+const permissionsBody = z
+  .object({
+    sandbox: z.enum(["read-only", "workspace-write"]),
+    network: z.boolean(),
+    webSearch: z.boolean(),
+    tools: z.array(z.enum(SCOPES as [Scope, ...Scope[]])),
+  })
+  .partial()
+  .transform(
+    (value) =>
+      Object.fromEntries(
+        Object.entries(value).filter(([, field]) => field !== undefined),
+      ) as Partial<AgentPermissions>,
+  );
+const agentBody = z.object({
   name: z.string().trim().min(1).max(80),
   description: z.string().max(500).optional(),
   instructions: z.string().max(10_000).optional(),
 });
-const updateAgentBody = createAgentBody.partial().refine(
-  (value) => Object.keys(value).length > 0,
-  "At least one field is required",
-);
+const createAgentBody = agentBody.extend({ permissions: permissionsBody.optional() });
+const updateAgentBody = agentBody
+  .partial()
+  .extend({ permissions: permissionsBody.optional() })
+  .refine((value) => Object.keys(value).length > 0, "At least one field is required");
 const messageBody = z.object({
   content: z.string().trim().min(1).max(50_000),
 });
@@ -44,6 +65,62 @@ export async function createApp(
 
   registerAuth(app, config);
 
+  /**
+   * The caller, from the verified JWT and nowhere else. The auth hook has
+   * already run for every route that calls this, so an absent principal is a
+   * routing mistake, not a request the caller can provoke.
+   */
+  const callerOf = (request: FastifyRequest): string => {
+    const principal = request.principal;
+    if (!principal) {
+      throw new HttpError(500, "Route reached without a verified principal");
+    }
+    return principal.userId;
+  };
+
+  /**
+   * Ownership gate for every `/api/agents/:id*` and `/api/runs/:id*` route
+   * (`docs/API.md` §Ownership), so a sub-route added later is covered by
+   * existing rather than by remembering to add a check. Ticket 06 adds
+   * `/api/grants/:id*` and `/api/approvals/:id*` to the same table.
+   * A malformed id is left alone for the route's own zod parse to answer 400.
+   */
+  // Arrows, not `.bind`: the method is looked up when a guarded route is hit,
+  // so building the app never depends on the service being fully populated.
+  const ownershipChecks = [
+    {
+      prefix: "/api/agents/",
+      check: (id: string, caller: string, action: string) =>
+        service.assertAgentOwnership(id, caller, action),
+    },
+    {
+      prefix: "/api/runs/",
+      check: (id: string, caller: string, action: string) =>
+        service.assertRunOwnership(id, caller, action),
+    },
+  ];
+
+  app.addHook("preHandler", async (request) => {
+    const route = request.routeOptions.url ?? "";
+    const matched = ownershipChecks.find((entry) => route.startsWith(entry.prefix));
+    if (!matched) {
+      return;
+    }
+    // Matched on the collection prefix, not on `:id`, so a route that names its
+    // parameter something else is caught here loudly instead of slipping past
+    // the gate unchecked. A malformed id still falls through to the route's own
+    // zod parse, which answers 400.
+    const { id } = (request.params ?? {}) as { id?: string };
+    if (id === undefined) {
+      throw new HttpError(500, "Guarded route " + route + " does not name its id param :id");
+    }
+    const parsed = agentIdParams.safeParse({ id });
+    if (!parsed.success) {
+      return;
+    }
+    await matched.check(parsed.data.id, callerOf(request), "api:" + request.method);
+  });
+
   app.get("/api/health", async () => ({
     ok: true,
     service: "volc-agent-launchpad",
@@ -57,11 +134,13 @@ export async function createApp(
 
   app.get("/api/system", async () => service.systemInfo());
 
-  app.get("/api/agents", async () => ({ agents: service.listAgents() }));
+  app.get("/api/agents", async (request) => ({
+    agents: service.listAgents(callerOf(request)),
+  }));
 
   app.post("/api/agents", async (request, reply) => {
     const body = createAgentBody.parse(request.body);
-    const agent = await service.createAgent(body);
+    const agent = await service.createAgent(body, callerOf(request));
     return reply.code(201).send({ agent });
   });
 
@@ -108,9 +187,16 @@ export async function createApp(
     return reply.code(202).send(result);
   });
 
+  // Checked in the handler rather than the hook above: this is the only route
+  // that reaches a resource by an id that is not an agent's.
   app.get("/api/runs/:id", async (request) => {
     const { id } = runIdParams.parse(request.params);
-    return { run: service.getRun(id) };
+    const run = await service.assertRunOwnership(
+      id,
+      callerOf(request),
+      "GET /api/runs/:id",
+    );
+    return { run };
   });
 
   if (config.nodeEnv === "production") {

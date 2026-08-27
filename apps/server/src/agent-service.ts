@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { recordEvent } from "./audit.js";
 import { signAgent } from "./auth.js";
 import type { AppConfig } from "./config.js";
 import { isArkConfigured } from "./config.js";
@@ -48,10 +49,16 @@ export class AgentService {
     });
   }
 
-  listAgents(): Agent[] {
+  /**
+   * Filtered server-side, and `ownerId` is required rather than optional: an
+   * optional filter on a tenant boundary is one forgotten argument away from
+   * listing everybody's agents.
+   */
+  listAgents(ownerId: string): Agent[] {
     return this.store
       .snapshot()
-      .agents.sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+      .agents.filter((agent) => agent.ownerId === ownerId)
+      .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
   }
 
   getAgent(id: string): Agent {
@@ -60,6 +67,68 @@ export class AgentService {
       throw new HttpError(404, "Agent not found");
     }
     return agent;
+  }
+
+  /**
+   * Cross-tenant isolation for `/api/agents/:id*`. An agent that does not exist
+   * is a plain 404 and is not logged — logging it would turn the audit trail
+   * into an oracle for probing which ids are real. An agent that exists but
+   * belongs to someone else is an explicit 403 and an audit row, because that
+   * is an attempt worth seeing in the timeline.
+   */
+  async assertAgentOwnership(
+    agentId: string,
+    callerId: string,
+    action: string,
+  ): Promise<Agent> {
+    const agent = this.getAgent(agentId);
+    if (agent.ownerId !== callerId) {
+      await this.denyCrossTenant(agent.id, callerId, action, "agent/" + agent.id);
+    }
+    return agent;
+  }
+
+  /**
+   * The same check for `/api/runs/:id`, which looks a run up by its own id and
+   * would otherwise be the one route that reads across tenants. Not on ticket
+   * 03's checklist; CLAUDE.md rule 3 is not scoped to the agent routes.
+   */
+  async assertRunOwnership(
+    runId: string,
+    callerId: string,
+    action: string,
+  ): Promise<AgentRun> {
+    const run = this.getRun(runId);
+    const agent = this.getAgent(run.agentId);
+    if (agent.ownerId !== callerId) {
+      await this.denyCrossTenant(agent.id, callerId, action, "run/" + run.id);
+    }
+    return run;
+  }
+
+  /**
+   * Row shape is fixed by `docs/API.md` §Ownership: `action` is `"api:<method>"`
+   * and `resource` is `"<kind>/<id>"`. `ownerId` is the *caller*, matching how
+   * `gateway.ts` records a deny — read the pair as who tried, and what for.
+   */
+  private async denyCrossTenant(
+    agentId: string,
+    callerId: string,
+    action: string,
+    resource: string,
+  ): Promise<never> {
+    await recordEvent(this.store, {
+      runId: null,
+      agentId,
+      ownerId: callerId,
+      kind: "gateway",
+      action,
+      resource,
+      decision: "deny",
+      reason: "cross-tenant",
+      detail: {},
+    });
+    throw new HttpError(403, "That resource belongs to another tenant");
   }
 
   // ownerId is threaded from request.principal by B1 (auth.ts); default keeps the baseline working.
@@ -102,6 +171,12 @@ export class AgentService {
       if (input.name !== undefined) agent.name = input.name.trim();
       if (input.description !== undefined) agent.description = input.description.trim();
       if (input.instructions !== undefined) agent.instructions = input.instructions.trim();
+      // The owner configuring their own agent. Distinct from ticket 06's
+      // `allow_always`, which widens the same field in response to an agent
+      // hitting a deny; both write it here rather than each finding their own way.
+      if (input.permissions !== undefined) {
+        agent.permissions = { ...agent.permissions, ...input.permissions };
+      }
       agent.lastError = null;
       agent.updatedAt = now();
       return structuredClone(agent);

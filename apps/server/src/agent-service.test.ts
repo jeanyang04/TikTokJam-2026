@@ -88,13 +88,13 @@ describe("Agent lifecycle", () => {
   it("creates, updates, stops, starts and deletes an Agent", async () => {
     const service = await makeService();
     const agent = await service.createAgent({ name: "Builder" });
-    expect(service.listAgents()).toHaveLength(1);
+    expect(service.listAgents("user-jean")).toHaveLength(1);
     expect((await service.updateAgent(agent.id, { description: "Builds apps" })).description)
       .toBe("Builds apps");
     expect((await service.stopAgent(agent.id)).status).toBe("stopped");
     expect((await service.startAgent(agent.id)).status).toBe("ready");
     await service.deleteAgent(agent.id);
-    expect(service.listAgents()).toHaveLength(0);
+    expect(service.listAgents("user-jean")).toHaveLength(0);
   });
 
   it("persists a playground conversation", async () => {
