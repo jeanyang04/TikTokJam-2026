@@ -109,9 +109,9 @@ the row on every call. Ticket 07's kill switch works the same way.
 **collection prefix** of `request.routeOptions.url`, not on `:id`, and returns early for
 anything else, so the gateway's `/mcp` and the proxy's `/llm` are untouched.
 
-**Ticket 06: `/api/grants/` and `/api/approvals/` are the two rows still missing** from
-`ownershipChecks` in `app.ts` — add them there rather than checking ownership inside your
-handlers.
+**Ticket 06 added the `/api/grants/` and `/api/approvals/` rows** to the same table.
+`grants.ts` and `approvals.ts` check the owner themselves as well; the gate is what turns
+that check into a 403 *plus* an audit row, and what keeps an unknown id a bare 404.
 
 **It fails closed on the case that would otherwise slip through.** Matching the prefix
 rather than `:id` means a route named `/api/agents/:agentId/grants` still enters the gate;
@@ -132,9 +132,10 @@ pattern. `ownerId` is the *caller*, matching `gateway.ts` — read `ownerId` and
 as "who tried" and "what they reached for". **F** renders `resource` verbatim in the
 timeline row, so don't reformat it.
 
-**`runId` is `null`** on these rows: an API call is not part of a run. **Ticket 06:**
-`GET /api/runs/:id/events` filters by `runId`, so cross-tenant denials will not appear in a
-run timeline. Decide there whether the timeline needs a second query by `ownerId`.
+**`runId` is `null`** on these rows: an API call is not part of a run, so cross-tenant
+denials never appear in a run timeline. **Resolved in ticket 06:** they surface on
+`GET /api/agents/:id/events`, which keys on `agentId` — always set, on every row. The run
+timeline stays run-scoped and needs no second query by `ownerId`.
 
 **`listAgents(ownerId)` takes the owner as a required argument.** Not optional, not
 defaulted — an optional filter on a tenant boundary is one forgotten argument away from
@@ -159,3 +160,34 @@ reaches `createAgent`, because the service spreads it over `DEFAULT_PERMISSIONS`
 **`/api/runs/:id` is checked by the same hook**, resolving the run's agent and then its
 owner. `docs/API.md` §Ownership names it in the preHandler list; ticket 03's checklist is
 merely silent about it.
+
+---
+
+## Policy routes: grants, cards, timelines (`app.ts` + `agent-service.ts`, B1's files)
+
+**Landed (B1, ticket 06):** the seven routes `docs/API.md` lists under Grants, Approvals
+and Events. Kill (`POST /api/agents/:id/kill`) is ticket 07 and is *not* in yet.
+
+**They go through `AgentService`, not through the store.** `app.ts` has no store handle,
+and giving it one would put data access in the routing layer. The service methods
+(`getGrants`, `createGrant`, `revokeGrant`, `listApprovals`, `decideApproval`,
+`getRunEvents`, `getAgentEvents`) are thin calls into `grants.ts` / `approvals.ts`, which
+stay Zeon's. Nothing is memoised — revoke-mid-run depends on reading the store per call.
+
+**`POST /api/grants/parse` will hit the `:id` trap.** It matches the `/api/grants/` prefix,
+finds no `id` param, and throws 500 before the handler runs. Whoever builds the NL stretch
+route: give the ownership gate an exemption, or mount the route somewhere that does not
+match a guarded prefix. `POST /api/grants` and `GET /api/approvals` are fine — no trailing
+slash, so no match — and they check the owner inside `createGrant` / `listApprovals`.
+
+**`fromAgent` is required and nullable, not optional** (`null` = the owner's own CRM, which
+has no source agent). Sending `{}` is a 400, not a CRM grant.
+
+**Grant failures split three ways, and F should render them apart:** `404` unknown agent ·
+`403` the recipient is not yours · `400` the source agent is another tenant's (D7,
+intra-tenant only).
+
+**`filter` defaults to `policy`** = kinds `gateway, approval, grant`; `all` adds
+`command, file_change, mcp_call, llm`. Both are ordered oldest-first by `at`.
+`GET /api/agents/:id/events` takes `limit` (default 200) and keeps the **newest** rows when
+it bites, still in `at` order.

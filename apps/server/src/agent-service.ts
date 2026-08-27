@@ -4,19 +4,30 @@ import { signAgent } from "./auth.js";
 import type { AppConfig } from "./config.js";
 import { isArkConfigured } from "./config.js";
 import { HttpError, RunCancelledError } from "./errors.js";
+import { decideApproval, listApprovals } from "./approvals.js";
+import { createGrant, listGrants, revokeGrant, type GrantInput } from "./grants.js";
 import { DEFAULT_PERMISSIONS, effectiveScopes, JsonStore } from "./store.js";
 import type {
   Agent,
   AgentRun,
   AgentRunner,
+  ApprovalDecision,
+  ApprovalRequest,
   CreateAgentInput,
   Message,
+  PolicyGrant,
+  RunEvent,
+  RunEventKind,
   RunToken,
   UpdateAgentInput,
 } from "./types.js";
 import { WorkspaceManager } from "./workspace.js";
 
 const now = () => new Date().toISOString();
+
+export type EventFilter = "policy" | "all";
+/** `docs/API.md` §Events: what a human decided or the gateway enforced. */
+const POLICY_EVENT_KINDS: RunEventKind[] = ["gateway", "approval", "grant"];
 
 export class AgentService {
   private readonly activeExecutions = new Map<string, Promise<void>>();
@@ -104,6 +115,43 @@ export class AgentService {
       await this.denyCrossTenant(agent.id, callerId, action, "run/" + run.id);
     }
     return run;
+  }
+
+  /**
+   * The same check for `/api/grants/:id*`. `grants.ts` refuses another tenant's
+   * grant too, but silently — the gate is where the 403 becomes an audit row,
+   * and where an unknown id stays a bare 404. The event's `agentId` is the
+   * grant's recipient: the identity the caller was reaching for.
+   */
+  async assertGrantOwnership(
+    grantId: string,
+    callerId: string,
+    action: string,
+  ): Promise<PolicyGrant> {
+    const grant = this.store.snapshot().policyGrants.find((item) => item.id === grantId);
+    if (!grant) {
+      throw new HttpError(404, "Grant not found");
+    }
+    if (grant.fromOwner !== callerId) {
+      await this.denyCrossTenant(grant.toAgent, callerId, action, "grant/" + grant.id);
+    }
+    return grant;
+  }
+
+  /** The same check for `/api/approvals/:id*`. */
+  async assertApprovalOwnership(
+    approvalId: string,
+    callerId: string,
+    action: string,
+  ): Promise<ApprovalRequest> {
+    const card = this.store.snapshot().approvals.find((item) => item.id === approvalId);
+    if (!card) {
+      throw new HttpError(404, "Approval not found");
+    }
+    if (card.ownerId !== callerId) {
+      await this.denyCrossTenant(card.agentId, callerId, action, "approval/" + card.id);
+    }
+    return card;
   }
 
   /**
@@ -229,6 +277,68 @@ export class AgentService {
       .snapshot()
       .runs.filter((run) => run.agentId === agentId)
       .sort((left, right) => right.createdAt.localeCompare(left.createdAt));
+  }
+
+  /**
+   * Grants and cards go through here rather than through `app.ts` directly, so
+   * every store read in the control plane has one door. The policy itself lives
+   * in `grants.ts` / `approvals.ts` (Zeon's) and is only called from here.
+   * Nothing is memoised: revoke-mid-run depends on reading the store per call.
+   */
+  getGrants(agentId: string): PolicyGrant[] {
+    this.getAgent(agentId);
+    return listGrants(this.store, agentId);
+  }
+
+  async createGrant(input: GrantInput, byOwner: string): Promise<PolicyGrant> {
+    return createGrant(this.store, input, byOwner);
+  }
+
+  async revokeGrant(grantId: string, byOwner: string): Promise<PolicyGrant> {
+    return revokeGrant(this.store, grantId, byOwner);
+  }
+
+  listApprovals(ownerId: string): ApprovalRequest[] {
+    return listApprovals(this.store, ownerId);
+  }
+
+  async decideApproval(
+    approvalId: string,
+    decision: ApprovalDecision,
+    byOwner: string,
+  ): Promise<ApprovalRequest> {
+    return decideApproval(this.store, approvalId, decision, byOwner);
+  }
+
+  /**
+   * The run timeline. `policy` is the default because that is the story the
+   * demo tells; `all` adds what the agent actually did in between.
+   */
+  getRunEvents(runId: string, filter: EventFilter = "policy"): RunEvent[] {
+    this.getRun(runId);
+    return this.selectEvents((event) => event.runId === runId, filter);
+  }
+
+  /**
+   * The agent timeline, across runs. It keys on `agentId` rather than on the
+   * agent's runs on purpose: a cross-tenant denial names the agent but no run
+   * (`runId: null`, docs/SEAMS.md), so it can only ever surface here.
+   */
+  getAgentEvents(agentId: string, filter: EventFilter = "policy", limit = 200): RunEvent[] {
+    this.getAgent(agentId);
+    const rows = this.selectEvents((event) => event.agentId === agentId, filter);
+    // Drop from the front when the limit bites: the newest rows are the ones
+    // being watched, and the order stays oldest-first for the timeline.
+    return rows.slice(Math.max(0, rows.length - limit));
+  }
+
+  private selectEvents(match: (event: RunEvent) => boolean, filter: EventFilter): RunEvent[] {
+    return this.store
+      .snapshot()
+      .runEvents.filter(
+        (event) => match(event) && (filter === "all" || POLICY_EVENT_KINDS.includes(event.kind)),
+      )
+      .sort((left, right) => left.at.localeCompare(right.at));
   }
 
   async sendMessage(

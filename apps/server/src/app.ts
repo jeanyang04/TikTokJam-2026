@@ -11,6 +11,8 @@ import type { AgentService } from "./agent-service.js";
 
 const agentIdParams = z.object({ id: z.string().uuid() });
 const runIdParams = z.object({ id: z.string().uuid() });
+const grantIdParams = z.object({ id: z.string().uuid() });
+const approvalIdParams = z.object({ id: z.string().uuid() });
 /**
  * Absent keys fall back to `DEFAULT_PERMISSIONS`, so an explicitly-undefined one
  * has to be dropped rather than spread: `{...DEFAULT_PERMISSIONS, sandbox:
@@ -42,6 +44,22 @@ const updateAgentBody = agentBody
   .refine((value) => Object.keys(value).length > 0, "At least one field is required");
 const messageBody = z.object({
   content: z.string().trim().min(1).max(50_000),
+});
+// `fromAgent: null` is the owner's own CRM, a tenant-level resource with no
+// source agent — so it is required and nullable rather than optional.
+const grantBody = z.object({
+  fromAgent: z.string().uuid().nullable(),
+  toAgent: z.string().uuid(),
+  resource: z.enum(["workspace", "crm"]),
+  actions: z.array(z.enum(["read", "write"])).min(1),
+  egress: z.array(z.enum(["internal", "agent", "external"])).optional(),
+});
+const decideBody = z.object({
+  decision: z.enum(["allow_run", "allow_always", "deny"]),
+});
+const eventsQuery = z.object({
+  filter: z.enum(["policy", "all"]).default("policy"),
+  limit: z.coerce.number().int().min(1).max(1000).default(200),
 });
 
 export async function createApp(
@@ -79,10 +97,10 @@ export async function createApp(
   };
 
   /**
-   * Ownership gate for every `/api/agents/:id*` and `/api/runs/:id*` route
-   * (`docs/API.md` §Ownership), so a sub-route added later is covered by
-   * existing rather than by remembering to add a check. Ticket 06 adds
-   * `/api/grants/:id*` and `/api/approvals/:id*` to the same table.
+   * Ownership gate for every `/api/agents/:id*`, `/api/runs/:id*`,
+   * `/api/grants/:id*` and `/api/approvals/:id*` route (`docs/API.md`
+   * §Ownership), so a sub-route added later is covered by existing rather than
+   * by remembering to add a check.
    * A malformed id is left alone for the route's own zod parse to answer 400.
    */
   // Arrows, not `.bind`: the method is looked up when a guarded route is hit,
@@ -97,6 +115,16 @@ export async function createApp(
       prefix: "/api/runs/",
       check: (id: string, caller: string, action: string) =>
         service.assertRunOwnership(id, caller, action),
+    },
+    {
+      prefix: "/api/grants/",
+      check: (id: string, caller: string, action: string) =>
+        service.assertGrantOwnership(id, caller, action),
+    },
+    {
+      prefix: "/api/approvals/",
+      check: (id: string, caller: string, action: string) =>
+        service.assertApprovalOwnership(id, caller, action),
     },
   ];
 
@@ -197,6 +225,47 @@ export async function createApp(
       "GET /api/runs/:id",
     );
     return { run };
+  });
+
+  app.get("/api/agents/:id/grants", async (request) => {
+    const { id } = agentIdParams.parse(request.params);
+    return { grants: service.getGrants(id) };
+  });
+
+  // Not under a guarded prefix, and it must not be: the resource being created
+  // has no id yet. `createGrant` checks both agents against the caller itself —
+  // 403 for an agent that is not theirs, 400 for a grant across tenants.
+  app.post("/api/grants", async (request, reply) => {
+    const body = grantBody.parse(request.body);
+    const grant = await service.createGrant(body, callerOf(request));
+    return reply.code(201).send({ grant });
+  });
+
+  app.post("/api/grants/:id/revoke", async (request) => {
+    const { id } = grantIdParams.parse(request.params);
+    return { grant: await service.revokeGrant(id, callerOf(request)) };
+  });
+
+  app.get("/api/approvals", async (request) => ({
+    approvals: service.listApprovals(callerOf(request)),
+  }));
+
+  app.post("/api/approvals/:id/decide", async (request) => {
+    const { id } = approvalIdParams.parse(request.params);
+    const { decision } = decideBody.parse(request.body);
+    return { approval: await service.decideApproval(id, decision, callerOf(request)) };
+  });
+
+  app.get("/api/runs/:id/events", async (request) => {
+    const { id } = runIdParams.parse(request.params);
+    const { filter } = eventsQuery.parse(request.query);
+    return { events: service.getRunEvents(id, filter) };
+  });
+
+  app.get("/api/agents/:id/events", async (request) => {
+    const { id } = agentIdParams.parse(request.params);
+    const { filter, limit } = eventsQuery.parse(request.query);
+    return { events: service.getAgentEvents(id, filter, limit) };
   });
 
   if (config.nodeEnv === "production") {

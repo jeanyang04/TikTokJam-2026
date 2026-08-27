@@ -123,12 +123,12 @@ describe("Ownership enforcement", () => {
     const jeansAgent = await service.createAgent({ name: "Writer" }, "user-jean");
     // Stands in for a sub-route a later ticket adds as /api/agents/:agentId/...:
     // the gate must refuse it rather than wave it through unchecked.
-    app.get("/api/agents/:agentId/grants", async () => ({ grants: [] }));
+    app.get("/api/agents/:agentId/probe", async () => ({ probed: true }));
     await app.ready();
 
     const response = await app.inject({
       method: "GET",
-      url: "/api/agents/" + jeansAgent.id + "/grants",
+      url: "/api/agents/" + jeansAgent.id + "/probe",
       headers: await as("user-alex"),
     });
 
