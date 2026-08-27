@@ -1,9 +1,9 @@
 import cors from "@fastify/cors";
 import fastifyStatic from "@fastify/static";
 import Fastify, { type FastifyInstance } from "fastify";
-import { timingSafeEqual } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
+import { registerAuth } from "./auth.js";
 import type { AppConfig } from "./config.js";
 import { HttpError } from "./errors.js";
 import type { AgentService } from "./agent-service.js";
@@ -42,33 +42,18 @@ export async function createApp(
         : false,
   });
 
-  app.addHook("onRequest", async (request, reply) => {
-    if (
-      !config.authToken ||
-      !request.url.startsWith("/api/") ||
-      request.url === "/api/health" ||
-      request.url === "/api/auth"
-    ) {
-      return;
-    }
-    const header = request.headers.authorization ?? "";
-    const candidate = header.startsWith("Bearer ") ? header.slice(7) : "";
-    const expectedBuffer = Buffer.from(config.authToken);
-    const candidateBuffer = Buffer.from(candidate);
-    const valid =
-      candidateBuffer.length === expectedBuffer.length &&
-      timingSafeEqual(candidateBuffer, expectedBuffer);
-    if (!valid) {
-      return reply.code(401).send({ error: "Authentication required" });
-    }
-  });
+  registerAuth(app, config);
 
   app.get("/api/health", async () => ({
     ok: true,
     service: "volc-agent-launchpad",
   }));
 
-  app.get("/api/auth", async () => ({ required: config.authToken.length > 0 }));
+  // Kept for the baseline UI's boot probe (apps/web/src/api.ts), which strands
+  // on its loading screen if this 401s or 404s. Now reports the JWT gate, which
+  // is always on: the token it asks for is a human JWT from /api/auth/login
+  // until F replaces this screen with the login bar.
+  app.get("/api/auth", async () => ({ required: true }));
 
   app.get("/api/system", async () => service.systemInfo());
 
