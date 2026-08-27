@@ -38,6 +38,11 @@ const envSchema = z.object({
     .max(128)
     .regex(/^[A-Za-z0-9._~-]*$/, "APP_AUTH_TOKEN must use URL-safe characters")
     .optional(),
+  JWT_SECRET: z.string().trim().min(1).default("dev-only-insecure-jwt-secret"),
+  SEED_USERS: z
+    .string()
+    .trim()
+    .default("user-jean:Jean,user-alex:Alex"),
   ARK_API_KEY: z.string().optional(),
   ARK_MODEL: z.string().optional(),
   ARK_BASE_URL: z
@@ -60,6 +65,23 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env) {
       );
     }
   }
+  if (env.NODE_ENV === "production" && !loopbackHosts.has(env.HOST)) {
+    if (env.JWT_SECRET.length < 24 || env.JWT_SECRET.startsWith("dev-only-")) {
+      throw new Error(
+        "JWT_SECRET must contain at least 24 characters for a non-loopback production server",
+      );
+    }
+  }
+  const seedUsers = env.SEED_USERS.split(",")
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0)
+    .map((entry) => {
+      const separator = entry.indexOf(":");
+      const id = separator === -1 ? entry : entry.slice(0, separator);
+      const name = separator === -1 ? entry : entry.slice(separator + 1);
+      return { id: id.trim(), name: name.trim() || id.trim() };
+    })
+    .filter((user) => user.id.length > 0);
   const defaultContainerUser =
     typeof process.getuid === "function" && typeof process.getgid === "function"
       ? process.getuid() + ":" + process.getgid()
@@ -84,6 +106,8 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env) {
     containerUser: env.CONTAINER_USER?.trim() || defaultContainerUser,
     runtimeInstanceId: env.RUNTIME_INSTANCE_ID,
     authToken,
+    jwtSecret: env.JWT_SECRET,
+    seedUsers,
     arkApiKey: env.ARK_API_KEY?.trim() ?? "",
     arkModel: env.ARK_MODEL?.trim() ?? "",
     arkBaseUrl: env.ARK_BASE_URL.replace(/\/+$/, ""),

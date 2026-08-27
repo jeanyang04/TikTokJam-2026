@@ -1,9 +1,9 @@
 import cors from "@fastify/cors";
 import fastifyStatic from "@fastify/static";
 import Fastify, { type FastifyInstance } from "fastify";
-import { timingSafeEqual } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
+import { registerAuth } from "./auth.js";
 import type { AppConfig } from "./config.js";
 import { HttpError } from "./errors.js";
 import type { AgentService } from "./agent-service.js";
@@ -42,26 +42,7 @@ export async function createApp(
         : false,
   });
 
-  app.addHook("onRequest", async (request, reply) => {
-    if (
-      !config.authToken ||
-      !request.url.startsWith("/api/") ||
-      request.url === "/api/health" ||
-      request.url === "/api/auth"
-    ) {
-      return;
-    }
-    const header = request.headers.authorization ?? "";
-    const candidate = header.startsWith("Bearer ") ? header.slice(7) : "";
-    const expectedBuffer = Buffer.from(config.authToken);
-    const candidateBuffer = Buffer.from(candidate);
-    const valid =
-      candidateBuffer.length === expectedBuffer.length &&
-      timingSafeEqual(candidateBuffer, expectedBuffer);
-    if (!valid) {
-      return reply.code(401).send({ error: "Authentication required" });
-    }
-  });
+  registerAuth(app, config);
 
   app.get("/api/health", async () => ({
     ok: true,
