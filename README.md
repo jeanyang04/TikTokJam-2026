@@ -249,3 +249,26 @@ docker compose config
 ## License
 
 [MIT](LICENSE)
+
+## Middleware: Identity & Authorization (TikTok Tech Jam 2026)
+
+**Selected track: Identity & Authorization.** Trace and threat-containment below are evidence for it, not extra tracks.
+
+**Problem.** Agents act autonomously with a master key and no identity. Nobody can answer *who let it, what can it reach, what did it do, can we stop it now.*
+
+**Solution — agents get capabilities, not credentials.** Every run gets its own scoped, short-lived, revocable identity (an agent JWT backed by an authoritative `RunToken` row). Every tool call passes one gateway (LOCK 1: `apps/server/src/gateway.ts`) that checks *who → which tool → whose data (PolicyGrant) → where may it go (taint/IFC)* and writes an audit row either way. Tenant data lives behind Postgres row-level security (LOCK 2), independent of gateway code. A human confirms every grant through an Access Request Card; grants can be revoked mid-run without stopping the agent.
+
+| Boundary | Decides | Crosses | On failure |
+|---|---|---|---|
+| Browser → API | human JWT + ownership hook | human JWT | 401; cross-tenant → 403 + audit; unknown id → 404 |
+| API → container | `sendMessage` mints RunToken | projected Codex config + agent JWT (no Ark key, no human JWT) | token expires with the run |
+| Container → gateway | scope · grant · taint pipeline | agent JWT + tool args → result or DENIED + card + audit | unset identity = deny; revoked = 403; gateway down = tool error, platform up |
+| Gateway → Postgres | RLS `owner_id = app.owner_id` | `SET LOCAL` from the verified token | policy false → 0 rows / 42501 → 403 |
+
+**Identity is mocked** (seeded users `Jean`/`Alex`, no password) as the brief permits; every authorization decision is server-side and tested. A real IdP swaps in at `auth.ts`.
+
+**Failure semantics.** Non-owner on an existing resource → 403 + RunEvent. Tool outside scope / no grant → structured `DENIED` + Access Request Card + RunEvent. Outbound call carrying grant-scoped data to a destination the grant didn't allow → 403 `ifc` naming the origin + declassify card. Grant revoked mid-run → next grant-gated call 403, its taint loses all egress, other tools continue. Kill switch → every call 403. Postgres down → CRM tools report unavailable, everything else works.
+
+**Limitations.** Owner-level tenancy, not hardened container isolation. Run-level taint over-blocks (any external egress after a grant-scoped read) — the declassify card is the escape hatch. The model still *sees* grant-scoped data; what we guarantee is it can't *move* it past the grant's scope through any tool we control. Approval is never same-turn: the tool returns DENIED, the human decides, the next message succeeds. Next steps: cross-tenant grants with from-owner approval; agent→agent delegation with attenuated scopes.
+
+Design: `docs/PLAN.md` · diagrams: `docs/DIAGRAMS.md` · routes: `docs/API.md` · team: `docs/TEAM.md`.

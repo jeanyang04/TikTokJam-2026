@@ -1,13 +1,48 @@
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
-import type { Database } from "./types.js";
+import type { Agent, AgentPermissions, Database, Scope } from "./types.js";
 
 const emptyDatabase = (): Database => ({
-  version: 1,
+  version: 2,
   agents: [],
   messages: [],
   runs: [],
+  runTokens: [],
+  policyGrants: [],
+  approvals: [],
+  runEvents: [],
 });
+
+/** Scopes a new RunToken should carry: permanent tools ∪ unexpired temp scopes. B1 calls this when minting. */
+export function effectiveScopes(agent: Pick<Agent, "permissions" | "tempScopes">, at = new Date().toISOString()): Scope[] {
+  const live = agent.tempScopes.filter((t) => t.expiresAt > at).map((t) => t.scope);
+  return [...new Set([...agent.permissions.tools, ...live])];
+}
+
+export const DEFAULT_PERMISSIONS: AgentPermissions = {
+  sandbox: "workspace-write",
+  network: true,
+  webSearch: false,
+  tools: [],
+};
+
+/** v1 (starter kit) → v2: existing agents belong to the first seeded user, no tool scopes. */
+export function migrateDatabase(raw: unknown, defaultOwner = "user-jean"): Database {
+  const parsed = raw as Omit<Partial<Database>, "version"> & { version?: number };
+  if (!Array.isArray(parsed.agents)) throw new Error("Unsupported database format");
+  if (parsed.version !== 1 && parsed.version !== 2) throw new Error("Unsupported database format");
+  return {
+    ...emptyDatabase(),
+    ...parsed,
+    version: 2,
+    agents: parsed.agents.map((agent) => ({
+      ...agent,
+      ownerId: agent.ownerId ?? defaultOwner,
+      permissions: { ...DEFAULT_PERMISSIONS, ...(agent.permissions ?? {}) },
+      tempScopes: agent.tempScopes ?? [],
+    })),
+  };
+}
 
 export class JsonStore {
   private data: Database = emptyDatabase();
@@ -19,11 +54,7 @@ export class JsonStore {
     await mkdir(path.dirname(this.filePath), { recursive: true });
     try {
       const raw = await readFile(this.filePath, "utf8");
-      const parsed = JSON.parse(raw) as Database;
-      if (parsed.version !== 1 || !Array.isArray(parsed.agents)) {
-        throw new Error("Unsupported database format");
-      }
-      this.data = parsed;
+      this.data = migrateDatabase(JSON.parse(raw));
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
         throw error;
