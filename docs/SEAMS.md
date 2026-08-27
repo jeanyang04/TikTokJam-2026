@@ -75,3 +75,27 @@ The gateway never imports `auth.ts`; `index.ts` adapts `verifyToken(config, raw,
 **"Allow for this run" writes `agent.tempScopes`.** B1: mint `RunToken.scp` with `effectiveScopes(agent)` from `store.ts`, or the follow-up message's new run drops the scope.
 
 **Audit:** `recordEvent(store, event)` in `audit.ts` is the one way to write a `RunEvent`. It redacts. B3's `redact.ts` replaces the redactor via `setRedactor(fn)`; don't fork the pattern list.
+
+---
+
+## RunToken minting (`agent-service.ts`, B1's file)
+
+**Landed (B1, ticket 04):** `sendMessage()` writes the `RunToken` row and the run in the
+*same* `store.mutate`, then `executeRun` signs the agent JWT and passes it to
+`runner.run()` as `request.token`.
+
+Three things that are easy to get wrong from the outside:
+
+**`scp` is `effectiveScopes(agent)`, not `permissions.tools`.** Permanent tools ∪ unexpired
+`tempScopes`, so a scope granted by "Allow for this run" survives into the follow-up
+message's run.
+
+**`request.permissions.tools` is the token's `scp`, not the agent's permanent tools.** The
+rest of `permissions` (sandbox, network, webSearch) is the agent's. B2 builds Codex's
+`enabled_tools` from `permissions.tools`, and this is what keeps a just-widened scope
+visible to the model. If you need the agent's permanent tools, read the agent.
+
+**The JWT is a snapshot; the row is the authority.** Its `exp` matches the row's
+`expiresAt` (`CODEX_TIMEOUT_MS + 60s`). Revoking mid-run means setting `revokedAt` on the
+row — the JWT stays valid-looking and the gateway rejects it anyway, because it re-reads
+the row on every call. Ticket 07's kill switch works the same way.

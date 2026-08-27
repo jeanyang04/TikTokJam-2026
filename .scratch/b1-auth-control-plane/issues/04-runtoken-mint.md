@@ -4,9 +4,19 @@
 
 **Blocked by:** 01 (Human login + JWT gate — needs `signAgent`), 02 (Store v2 migration — needs `RunToken`/`Agent` types and store collections).
 
-**Status:** ready-for-agent
+**Status:** done (commit `d86d978`)
 
-- [ ] Inside `agent-service.ts:157`'s existing `store.mutate` (around L185): mint `RunToken{jti, runId, agentId, ownerId, scp:[...permissions.tools], taints:[], expiresAt}`
-- [ ] Agent JWT `{sub:agentId, typ:"agent", own:ownerId, run:runId, jti, scp, exp}` signed and passed into `executeRun`/`runner.run()`
-- [ ] Expiry set to `CODEX_TIMEOUT_MS + 60s`
-- [ ] Test: after `sendMessage()`, a RunToken row exists in the store for the run; the agent JWT verifies with `typ:"agent"` and matches the RunToken's `jti`
+- [x] Inside `agent-service.ts:157`'s existing `store.mutate` (around L185): mint `RunToken{jti, runId, agentId, ownerId, scp:[...permissions.tools], taints:[], expiresAt}`
+- [x] Agent JWT `{sub:agentId, typ:"agent", own:ownerId, run:runId, jti, scp, exp}` signed and passed into `executeRun`/`runner.run()`
+- [x] Expiry set to `CODEX_TIMEOUT_MS + 60s`
+- [x] Test: after `sendMessage()`, a RunToken row exists in the store for the run; the agent JWT verifies with `typ:"agent"` and matches the RunToken's `jti`
+
+**Deviation from the checklist, deliberate.** `scp` is `effectiveScopes(agent)` (permanent
+tools ∪ unexpired `tempScopes`), not `[...permissions.tools]` as written above. Taking the
+checklist literally would drop an "Allow for this run" scope on the follow-up message, which
+is Scene 1. `docs/SEAMS.md` line 75 calls for the same thing.
+
+`request.permissions.tools` also carries the token's `scp` rather than the agent's permanent
+tools, because B2's `codex-runner.ts:86` builds Codex's `enabled_tools` from it. Without that,
+a just-widened scope is enforceable at the gateway but invisible to the model, so the agent
+never tries the tool it was just allowed. Recorded in `docs/SEAMS.md`.
