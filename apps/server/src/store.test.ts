@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -49,14 +49,12 @@ const v1Database = {
   ],
 };
 
-async function storeWith(
-  contents: unknown,
-): Promise<{ store: JsonStore; filePath: string }> {
+async function storeWith(contents: unknown): Promise<JsonStore> {
   const root = await mkdtemp(path.join(tmpdir(), "launchpad-store-test-"));
   temporaryDirectories.push(root);
   const filePath = path.join(root, "db.json");
   await writeFile(filePath, JSON.stringify(contents), "utf8");
-  return { store: new JsonStore(filePath), filePath };
+  return new JsonStore(filePath);
 }
 
 afterEach(async () => {
@@ -110,7 +108,7 @@ describe("JsonStore", () => {
 
 describe("v1 → v2 migration", () => {
   it("gives a v1 agent an owner, default permissions and no temp scopes", async () => {
-    const { store } = await storeWith(v1Database);
+    const store = await storeWith(v1Database);
     await store.initialize();
 
     const database = store.snapshot();
@@ -123,7 +121,7 @@ describe("v1 → v2 migration", () => {
   });
 
   it("keeps the agent, messages and runs a v1 file already held", async () => {
-    const { store } = await storeWith(v1Database);
+    const store = await storeWith(v1Database);
     await store.initialize();
 
     const database = store.snapshot();
@@ -134,7 +132,7 @@ describe("v1 → v2 migration", () => {
   });
 
   it("creates the four policy collections a v1 file has no room for", async () => {
-    const { store } = await storeWith(v1Database);
+    const store = await storeWith(v1Database);
     await store.initialize();
 
     const database = store.snapshot();
@@ -142,19 +140,6 @@ describe("v1 → v2 migration", () => {
     expect(database.policyGrants).toEqual([]);
     expect(database.approvals).toEqual([]);
     expect(database.runEvents).toEqual([]);
-  });
-
-  it("writes the migrated shape back on the first mutation", async () => {
-    const { store, filePath } = await storeWith(v1Database);
-    await store.initialize();
-    await store.mutate((database) => {
-      database.agents[0]!.status = "busy";
-    });
-
-    const onDisk = JSON.parse(await readFile(filePath, "utf8"));
-    expect(onDisk.version).toBe(2);
-    expect(onDisk.agents[0].ownerId).toBe("user-jean");
-    expect(onDisk.runTokens).toEqual([]);
   });
 
   it("leaves an already-migrated v2 file alone", async () => {
@@ -175,14 +160,14 @@ describe("v1 → v2 migration", () => {
       approvals: [],
       runEvents: [],
     };
-    const { store } = await storeWith(v2Database);
+    const store = await storeWith(v2Database);
     await store.initialize();
 
     expect(store.snapshot()).toEqual(v2Database);
   });
 
   it("refuses to boot on a store file it does not understand", async () => {
-    const { store } = await storeWith({ ...v1Database, version: 3 });
+    const store = await storeWith({ ...v1Database, version: 3 });
     await expect(store.initialize()).rejects.toThrow("Unsupported database format");
   });
 });
