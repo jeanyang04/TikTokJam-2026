@@ -1,14 +1,16 @@
 import { randomUUID } from "node:crypto";
+import { signAgent } from "./auth.js";
 import type { AppConfig } from "./config.js";
 import { isArkConfigured } from "./config.js";
 import { HttpError, RunCancelledError } from "./errors.js";
-import { DEFAULT_PERMISSIONS, JsonStore } from "./store.js";
+import { DEFAULT_PERMISSIONS, effectiveScopes, JsonStore } from "./store.js";
 import type {
   Agent,
   AgentRun,
   AgentRunner,
   CreateAgentInput,
   Message,
+  RunToken,
   UpdateAgentInput,
 } from "./types.js";
 import { WorkspaceManager } from "./workspace.js";
@@ -186,7 +188,9 @@ export class AgentService {
       content: prompt,
       createdAt: timestamp,
     };
-    const agentAtStart = await this.store.mutate((database) => {
+    // The token row and the run are written in one mutation: a run that exists
+    // without an identity would be a run the gateway cannot check.
+    const { agent: agentAtStart, runToken } = await this.store.mutate((database) => {
       const storedAgent = database.agents.find((item) => item.id === agentId);
       if (!storedAgent) {
         throw new HttpError(404, "Agent not found");
@@ -199,13 +203,28 @@ export class AgentService {
       }
       database.runs.push(run);
       database.messages.push(message);
+      const token: RunToken = {
+        jti: randomUUID(),
+        runId,
+        agentId,
+        ownerId: storedAgent.ownerId,
+        // tools ∪ live tempScopes, so an "Allow for this run" grant survives into
+        // the follow-up message's run (docs/SEAMS.md).
+        scp: effectiveScopes(storedAgent, timestamp),
+        taints: [],
+        issuedAt: timestamp,
+        expiresAt: new Date(Date.parse(timestamp) + this.config.codexTimeoutMs + 60_000)
+          .toISOString(),
+        revokedAt: null,
+      };
+      database.runTokens.push(token);
       const snapshot = structuredClone(storedAgent);
       storedAgent.status = "busy";
       storedAgent.lastError = null;
       storedAgent.updatedAt = timestamp;
-      return snapshot;
+      return { agent: snapshot, runToken: token };
     });
-    const execution = this.executeRun(agentAtStart, run);
+    const execution = this.executeRun(agentAtStart, run, runToken);
     this.activeExecutions.set(agentId, execution);
     void execution
       .finally(() => {
@@ -236,7 +255,11 @@ export class AgentService {
     };
   }
 
-  private async executeRun(agentAtStart: Agent, run: AgentRun): Promise<void> {
+  private async executeRun(
+    agentAtStart: Agent,
+    run: AgentRun,
+    runToken: RunToken,
+  ): Promise<void> {
     await this.store.mutate((database) => {
       const storedRun = database.runs.find((item) => item.id === run.id);
       if (storedRun) {
@@ -248,11 +271,28 @@ export class AgentService {
       if (this.cancellationRequests.has(agentAtStart.id)) {
         throw new RunCancelledError();
       }
+      // A snapshot of the row, not the authority: the gateway re-reads the row
+      // on every call so a revoke mid-run takes effect immediately.
+      const token = await signAgent(this.config, {
+        sub: runToken.agentId,
+        own: runToken.ownerId,
+        run: runToken.runId,
+        jti: runToken.jti,
+        scp: runToken.scp,
+        expiresInSeconds: Math.ceil(
+          (Date.parse(runToken.expiresAt) - Date.now()) / 1000,
+        ),
+      });
       const result = await this.runner.run({
         agentId: agentAtStart.id,
         workspacePath: agentAtStart.workspacePath,
         prompt: run.prompt,
         threadId: agentAtStart.codexThreadId,
+        token,
+        // tools comes from the token's scope set, not the agent's permanent tools:
+        // B2 builds Codex's enabled_tools from this, so an "Allow for this run"
+        // scope would otherwise never reach the model's menu (docs/SEAMS.md).
+        permissions: { ...agentAtStart.permissions, tools: runToken.scp },
       });
       const completedAt = now();
       await this.store.mutate((database) => {
