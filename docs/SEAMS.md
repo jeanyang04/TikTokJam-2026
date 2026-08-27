@@ -52,3 +52,17 @@ The verified principal is on `request.principal` as `{typ:"human", userId}`. **O
 **`/api/auth` is open, and `docs/PLAN.md` §2's list omits it.** §2 was written before anyone checked which routes exist. The baseline UI probes `/api/auth` at boot, and on failure `App.tsx:93` catches into an error banner without setting `authRequired`, stranding the app on its loading screen with no way in. The route now reports `{required: true}`. Leave it open and leave it truthful.
 
 **F:** that boot probe is why the app still starts. Once the login bar replaces the token screen, `GET /api/auth` and the whole `authRequired` branch can go.
+
+### Routes ticket 01 added
+
+Here because `docs/API.md` did not exist yet and F is told to build against it. **`docs/API.md` is the contract** — when Zeon posts it, these move there and this block goes.
+
+```
+POST /api/auth/login   {userId}  ->  200 {token, user:{id, name}}
+                                     401 {error} — userId not in SEED_USERS
+                                     400 {error, details} — missing or malformed body
+GET  /api/auth                   ->  200 {required: true}   (open, no token)
+GET  /api/health                 ->  200                    (open, no token)
+```
+
+Every other `/api/*` route needs `Authorization: Bearer <token>` and answers **401 `{error}`** without a valid one. The token is the `token` field above, verbatim. It expires after 8h, so a 401 on a route that worked earlier means expired, not forbidden: clear the stored token and show the login bar. Ownership failures are **403**, and land in ticket 03.
