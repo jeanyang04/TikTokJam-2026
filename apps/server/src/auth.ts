@@ -2,6 +2,7 @@ import { SignJWT, jwtVerify } from "jose";
 import type { FastifyInstance, FastifyRequest } from "fastify";
 import { z } from "zod";
 import type { AppConfig } from "./config.js";
+import { SCOPES, type Scope } from "./types.js";
 
 const ALGORITHM = "HS256";
 const HUMAN_TOKEN_LIFETIME = "8h";
@@ -19,8 +20,7 @@ export interface AgentPrincipal {
   ownerId: string;
   runId: string;
   jti: string;
-  /** TODO: narrow to Scope[] once Zeon's types.ts lands. */
-  scp: string[];
+  scp: Scope[];
 }
 
 export type Principal = HumanPrincipal | AgentPrincipal;
@@ -30,7 +30,7 @@ export interface AgentClaimsInput {
   own: string;
   run: string;
   jti: string;
-  scp: string[];
+  scp: Scope[];
   expiresInSeconds: number;
 }
 
@@ -47,7 +47,7 @@ const agentClaims = z.object({
   own: z.string().min(1),
   run: z.string().min(1),
   jti: z.string().min(1),
-  scp: z.array(z.string()),
+  scp: z.array(z.enum(SCOPES as [Scope, ...Scope[]])),
 });
 
 /**

@@ -39,7 +39,7 @@ Three things the signatures don't say:
 
 **The expected type is an argument, never read off the token.** `verifyToken(config, raw, "agent")` refuses a human token and vice versa. Asking for what you expect is what makes that hold, so a human JWT can never reach the gateway as an agent identity.
 
-**`AgentPrincipal.scp` is `string[]`,** not `Scope[]` — `types.ts` was still v1 baseline when ticket 01 landed. Narrow it once Zeon's contract is in.
+**`AgentPrincipal.scp` is `Scope[]`** (narrowed by Zeon when the contract merged; `agentClaims` validates against `SCOPES` from `types.ts`, so a token carrying an unknown scope fails verification).
 
 ---
 
@@ -53,16 +53,25 @@ The verified principal is on `request.principal` as `{typ:"human", userId}`. **O
 
 **F:** that boot probe is why the app still starts. Once the login bar replaces the token screen, `GET /api/auth` and the whole `authRequired` branch can go.
 
-### Routes ticket 01 added
+### Routes
 
-Here because `docs/API.md` did not exist yet and F is told to build against it. **`docs/API.md` is the contract** — when Zeon posts it, these move there and this block goes.
+All routes and shapes live in `docs/API.md` (the contract). This file only records seam conventions.
 
-```
-POST /api/auth/login   {userId}  ->  200 {token, user:{id, name}}
-                                     401 {error} — userId not in SEED_USERS
-                                     400 {error, details} — missing or malformed body
-GET  /api/auth                   ->  200 {required: true}   (open, no token)
-GET  /api/health                 ->  200                    (open, no token)
-```
+---
 
-Every other `/api/*` route needs `Authorization: Bearer <token>` and answers **401 `{error}`** without a valid one. The token is the `token` field above, verbatim. It expires after 8h, so a 401 on a route that worked earlier means expired, not forbidden: clear the stored token and show the login bar. Ownership failures are **403**, and land in ticket 03.
+## The gateway (`gateway.ts`, Zeon's file) — mounted in `index.ts`
+
+`gatewayPlugin` is registered in `index.ts` with a `GatewayDeps` object. Two slots are **left for other owners**:
+
+- **`withOwner`** (B3): `(ownerId, agentId, fn) => Promise<T>` — transaction with `SET LOCAL app.owner_id/app.agent_id`. Until it's passed, `crm_read`/`crm_write` answer "CRM resource unavailable" and log an `error` event; nothing else is affected.
+- **`webhookSink`** (B2): `(url, body) => Promise<{status}>`. Until it's passed, `webhook_send` fails closed after the IFC check.
+
+Add your function to the `app.register(gatewayPlugin, {...})` call — that is the *only* line in `index.ts` you need to touch.
+
+The gateway never imports `auth.ts`; `index.ts` adapts `verifyToken(config, raw, "agent")` (returns `null`) to the gateway's throwing `verifyAgentToken`. Keep it that way so `gateway.test.ts` can run with a test signer.
+
+**All five tools are always registered.** The model's menu is shaped by Codex `enabled_tools` (B2) — build that list from `RunToken.scp`, not `agent.permissions.tools`, or "Allow for this run" is invisible to the model.
+
+**"Allow for this run" writes `agent.tempScopes`.** B1: mint `RunToken.scp` with `effectiveScopes(agent)` from `store.ts`, or the follow-up message's new run drops the scope.
+
+**Audit:** `recordEvent(store, event)` in `audit.ts` is the one way to write a `RunEvent`. It redacts. B3's `redact.ts` replaces the redactor via `setRedactor(fn)`; don't fork the pattern list.

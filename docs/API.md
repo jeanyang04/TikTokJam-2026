@@ -8,18 +8,28 @@ Every gateway/proxy route requires an **agent JWT**.
 
 | Route | Body | Response |
 |---|---|---|
-| `POST /api/auth/login` | `{ userId: "user-jean" \| "user-alex" }` | `200 { token, user: { id, name } }` · `404` unknown user |
-| `GET /api/auth/me` | — | `200 { id, name }` |
+| `POST /api/auth/login` | `{ userId: "user-jean" \| "user-alex" }` | `200 { token, user: { id, name } }` · `401 { error }` unknown user · `400` malformed |
+| `GET /api/auth` | — (open) | `200 { required: true }` — baseline UI boot probe; F removes it with the login bar |
+| `GET /api/health` | — (open) | `200` |
 
-Human JWT claims: `{ sub, typ:"human", name, exp }`. Agent JWT claims: `{ sub:agentId, typ:"agent", own:ownerId, run:runId, jti, scp:Scope[], exp }`.
-`auth.ts` exports `signHuman(userId)`, `signAgent(claims)`, `verifyToken(raw, "human"|"agent")`. The gateway accepts any `(raw) => Promise<AgentClaims>`; `gateway.ts#makeJwtVerifier(secret)` is the default.
+Every other `/api/*` route needs `Authorization: Bearer <token>` → else `401 { error }`. Token expires after 8 h: a 401 on a route that worked = expired → clear it, show the login bar.
+Human JWT claims: `{ sub, typ:"human", exp }`. Agent JWT claims: `{ sub:agentId, typ:"agent", own:ownerId, run:runId, jti, scp:Scope[], exp }`.
+
+`auth.ts` (landed, B1):
+```ts
+signHuman(config, userId): Promise<string>
+signAgent(config, { sub, own, run, jti, scp, expiresInSeconds }): Promise<string>
+verifyToken(config, raw, "human"): Promise<HumanPrincipal | null>   // { typ, userId }
+verifyToken(config, raw, "agent"): Promise<AgentPrincipal | null>   // { typ, agentId, ownerId, runId, jti, scp }
+```
+`verifyToken` returns **null** on every failure (never throws); the expected type is an argument, never read off the token. `request.principal` carries the human principal on `/api/*`. The gateway is wired in `index.ts` with a 4-line adapter from `AgentPrincipal` to the gateway's `AgentClaims`.
 
 **Minting (B1, in `AgentService.sendMessage`)** — inside the existing `store.mutate`:
 ```ts
 const scp = effectiveScopes(storedAgent);            // store.ts: permissions.tools ∪ live tempScopes
 const jti = randomUUID(), expiresAt = new Date(Date.now() + config.codexTimeoutMs + 60_000).toISOString();
 database.runTokens.push({ jti, runId, agentId, ownerId: storedAgent.ownerId, scp, taints: [], issuedAt: timestamp, expiresAt, revokedAt: null });
-// then: token = await signAgent({ sub: agentId, own: storedAgent.ownerId, run: runId, jti, scp, exp })
+// then: token = await signAgent(config, { sub: agentId, own: storedAgent.ownerId, run: runId, jti, scp, expiresInSeconds: config.codexTimeoutMs / 1000 + 60 })
 // pass { token, permissions: { ...storedAgent.permissions, tools: scp } } into executeRun → runner.run()
 ```
 
@@ -99,9 +109,7 @@ Tools (all five always listed; enforcement on call):
 Denied calls return `isError:true` with text `DENIED (<reason>): <message>. An Access Request Card is pending operator approval — tell the user, then retry after they approve.`
 
 Plugin registration (index.ts, Zeon + B1 at Sync 1):
-```ts
-await app.register(gatewayPlugin, { store, workspaceRoot: config.workspaceRoot, verifyAgentToken: (raw) => verifyToken(raw, "agent"), withOwner, webhookSink, enforce: config.gatewayEnforce });
-```
+Already mounted in `index.ts` (Zeon). **B3:** add `withOwner` to that call when `db.ts` lands. **B2:** add `webhookSink`. `GATEWAY_ENFORCE=false` env skips scope/grant/egress checks for the RLS demo.
 
 ## Runtime projection (B2 — `codex-runner.ts`)
 
