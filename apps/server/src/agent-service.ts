@@ -1,19 +1,44 @@
 import { randomUUID } from "node:crypto";
+import { recordEvent } from "./audit.js";
+import { signAgent } from "./auth.js";
 import type { AppConfig } from "./config.js";
 import { isArkConfigured } from "./config.js";
 import { HttpError, RunCancelledError } from "./errors.js";
-import { DEFAULT_PERMISSIONS, JsonStore } from "./store.js";
+import { decideApproval, listApprovals } from "./approvals.js";
+import { createGrant, listGrants, revokeGrant, type GrantInput } from "./grants.js";
+import { DEFAULT_PERMISSIONS, effectiveScopes, JsonStore } from "./store.js";
 import type {
   Agent,
   AgentRun,
   AgentRunner,
+  ApprovalDecision,
+  ApprovalRequest,
   CreateAgentInput,
   Message,
+  PolicyGrant,
+  RunEvent,
+  RunEventKind,
+  RunToken,
   UpdateAgentInput,
 } from "./types.js";
 import { WorkspaceManager } from "./workspace.js";
 
 const now = () => new Date().toISOString();
+
+/**
+ * Revocation narrows and never widens: an already-revoked row keeps its first
+ * timestamp, because *when* an identity died is the evidence. The run ending and
+ * the operator's Kill switch both come through here so the rule is stated once.
+ */
+function revokeToken(token: RunToken, at: string): void {
+  if (!token.revokedAt) {
+    token.revokedAt = at;
+  }
+}
+
+export type EventFilter = "policy" | "all";
+/** `docs/API.md` §Events: what a human decided or the gateway enforced. */
+const POLICY_EVENT_KINDS: RunEventKind[] = ["gateway", "approval", "grant"];
 
 export class AgentService {
   private readonly activeExecutions = new Map<string, Promise<void>>();
@@ -46,10 +71,16 @@ export class AgentService {
     });
   }
 
-  listAgents(): Agent[] {
+  /**
+   * Filtered server-side, and `ownerId` is required rather than optional: an
+   * optional filter on a tenant boundary is one forgotten argument away from
+   * listing everybody's agents.
+   */
+  listAgents(ownerId: string): Agent[] {
     return this.store
       .snapshot()
-      .agents.sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+      .agents.filter((agent) => agent.ownerId === ownerId)
+      .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
   }
 
   getAgent(id: string): Agent {
@@ -58,6 +89,120 @@ export class AgentService {
       throw new HttpError(404, "Agent not found");
     }
     return agent;
+  }
+
+  /**
+   * Cross-tenant isolation for `/api/agents/:id*`. An agent that does not exist
+   * is a plain 404 and is not logged — logging it would turn the audit trail
+   * into an oracle for probing which ids are real. An agent that exists but
+   * belongs to someone else is an explicit 403 and an audit row, because that
+   * is an attempt worth seeing in the timeline.
+   */
+  async assertAgentOwnership(
+    agentId: string,
+    callerId: string,
+    action: string,
+  ): Promise<Agent> {
+    const agent = this.getAgent(agentId);
+    if (agent.ownerId !== callerId) {
+      await this.denyCrossTenant(agent.id, callerId, action, "agent/" + agent.id);
+    }
+    return agent;
+  }
+
+  /**
+   * The same check for `/api/runs/:id`, which looks a run up by its own id and
+   * would otherwise be the one route that reads across tenants. Not on ticket
+   * 03's checklist; CLAUDE.md rule 3 is not scoped to the agent routes.
+   */
+  async assertRunOwnership(
+    runId: string,
+    callerId: string,
+    action: string,
+  ): Promise<AgentRun> {
+    const run = this.getRun(runId);
+    const agent = this.getAgent(run.agentId);
+    if (agent.ownerId !== callerId) {
+      await this.denyCrossTenant(agent.id, callerId, action, "run/" + run.id);
+    }
+    return run;
+  }
+
+  /**
+   * The same check for `/api/grants/:id*`. `grants.ts` refuses another tenant's
+   * grant too, but silently — the gate is where the 403 becomes an audit row,
+   * and where an unknown id stays a bare 404. The event's `agentId` is the
+   * grant's recipient: the identity the caller was reaching for.
+   */
+  async assertGrantOwnership(
+    grantId: string,
+    callerId: string,
+    action: string,
+  ): Promise<PolicyGrant> {
+    const grant = this.store.snapshot().policyGrants.find((item) => item.id === grantId);
+    if (!grant) {
+      throw new HttpError(404, "Grant not found");
+    }
+    if (grant.fromOwner !== callerId) {
+      await this.denyCrossTenant(grant.toAgent, callerId, action, "grant/" + grant.id);
+    }
+    return grant;
+  }
+
+  /** The same check for `/api/approvals/:id*`. */
+  async assertApprovalOwnership(
+    approvalId: string,
+    callerId: string,
+    action: string,
+  ): Promise<ApprovalRequest> {
+    const card = this.store.snapshot().approvals.find((item) => item.id === approvalId);
+    if (!card) {
+      throw new HttpError(404, "Approval not found");
+    }
+    if (card.ownerId !== callerId) {
+      await this.denyCrossTenant(card.agentId, callerId, action, "approval/" + card.id);
+    }
+    return card;
+  }
+
+  /**
+   * Row shape is fixed by `docs/API.md` §Ownership: `action` is `"api:<method>"`
+   * and `resource` is `"<kind>/<id>"`. `ownerId` is the *caller*, matching how
+   * `gateway.ts` records a deny — read the pair as who tried, and what for.
+   */
+  private async denyCrossTenant(
+    agentId: string,
+    callerId: string,
+    action: string,
+    resource: string,
+  ): Promise<never> {
+    await this.logCrossTenant(agentId, callerId, action, resource);
+    throw new HttpError(403, "That resource belongs to another tenant");
+  }
+
+  /**
+   * The row on its own, for the one caller that must record the attempt but
+   * answer something other than 403 (`createGrant`, whose cross-tenant *source*
+   * is a 400 by contract). Every cross-tenant refusal is audited; not every one
+   * is a 403.
+   */
+  private async logCrossTenant(
+    agentId: string,
+    callerId: string,
+    action: string,
+    resource: string,
+  ): Promise<void> {
+    await recordEvent(this.store, {
+      runId: null,
+      agentId,
+      ownerId: callerId,
+      kind: "gateway",
+      action,
+      resource,
+      decision: "deny",
+      reason: "cross-tenant",
+      detail: {},
+    });
   }
 
   // ownerId is threaded from request.principal by B1 (auth.ts); default keeps the baseline working.
@@ -100,6 +245,12 @@ export class AgentService {
       if (input.name !== undefined) agent.name = input.name.trim();
       if (input.description !== undefined) agent.description = input.description.trim();
       if (input.instructions !== undefined) agent.instructions = input.instructions.trim();
+      // The owner configuring their own agent. Distinct from ticket 06's
+      // `allow_always`, which widens the same field in response to an agent
+      // hitting a deny; both write it here rather than each finding their own way.
+      if (input.permissions !== undefined) {
+        agent.permissions = { ...agent.permissions, ...input.permissions };
+      }
       agent.lastError = null;
       agent.updatedAt = now();
       return structuredClone(agent);
@@ -154,6 +305,157 @@ export class AgentService {
       .sort((left, right) => right.createdAt.localeCompare(left.createdAt));
   }
 
+  /**
+   * The Kill switch: end this agent's identity, everywhere, now. Every live
+   * RunToken is revoked and the tool scopes are emptied, so a call in flight is
+   * refused on its next hop (the gateway re-reads the row) and no later run can
+   * mint the scopes back.
+   *
+   * **`tempScopes` goes with `permissions.tools`.** `docs/API.md` §Agents names
+   * only `tools`, but `RunToken.scp` is `effectiveScopes(agent)` = tools ∪ live
+   * tempScopes, so leaving an "Allow for this run" scope behind would hand it
+   * straight back to the next run. Killing one of the two is not killing.
+   *
+   * Runs regardless of status: a PATCH mid-run is an edit that can wait, a kill
+   * cannot. The container is left alone — Stop is what kills the process.
+   */
+  async killAgent(agentId: string, callerId: string): Promise<Agent> {
+    const { agent: killed, runIds } = await this.store.mutate((database) => {
+      const agent = database.agents.find((item) => item.id === agentId);
+      if (!agent) {
+        throw new HttpError(404, "Agent not found");
+      }
+      const timestamp = now();
+      const revoked: string[] = [];
+      for (const token of database.runTokens) {
+        if (token.agentId === agentId && !token.revokedAt) {
+          revoked.push(token.runId);
+        }
+        if (token.agentId === agentId) {
+          revokeToken(token, timestamp);
+        }
+      }
+      agent.permissions = { ...agent.permissions, tools: [] };
+      agent.tempScopes = [];
+      agent.updatedAt = timestamp;
+      return { agent: structuredClone(agent), runIds: revoked };
+    });
+    // Before the summary row, so the kill is the last word in the timeline.
+    const voidedCards = await this.voidPendingCards(agentId, callerId);
+    await recordEvent(this.store, {
+      // Unlike every other API row this one names a run, because the run timeline
+      // has no other honest record of the kill: `gateway.ts` audits the refused
+      // call it causes before it has a verified identity, so that row lands as
+      // `agentId: "unknown"` with no run. **Zeon:** auditing the revoked branch
+      // from the claims would attribute it, and this could go back to null.
+      runId: runIds.length === 1 ? (runIds[0] ?? null) : null,
+      agentId,
+      ownerId: callerId,
+      kind: "gateway",
+      action: "kill",
+      resource: "agent/" + agentId,
+      decision: "deny",
+      reason: "revoked-by-operator",
+      detail: { revokedRuns: runIds, voidedCards },
+    });
+    return killed;
+  }
+
+  /**
+   * A card the agent provoked before the kill would otherwise still be sitting in
+   * the operator's queue, and answering it with "Always allow" writes straight
+   * back into `permissions.tools` — resurrecting the identity that was killed.
+   * They are refused through `decideApproval`, so each one lands in the audit
+   * trail as the decision it now is.
+   */
+  private async voidPendingCards(agentId: string, callerId: string): Promise<number> {
+    const pending = this.store
+      .snapshot()
+      .approvals.filter((card) => card.agentId === agentId && card.status === "pending");
+    for (const card of pending) {
+      await decideApproval(this.store, card.id, "deny", callerId);
+    }
+    return pending.length;
+  }
+
+  /**
+   * Grants and cards go through here rather than through `app.ts` directly, so
+   * every store read in the control plane has one door. The policy itself lives
+   * in `grants.ts` / `approvals.ts` (Zeon's) and is only called from here.
+   * Nothing is memoised: revoke-mid-run depends on reading the store per call.
+   */
+  getGrants(agentId: string): PolicyGrant[] {
+    this.getAgent(agentId);
+    return listGrants(this.store, agentId);
+  }
+
+  /**
+   * `createGrant` refuses both cross-tenant reaches itself, but silently, and
+   * `POST /api/grants` names no id for the ownership gate to guard — so the
+   * audit row CLAUDE.md rule 3 requires is written here, before delegating.
+   * The recipient is a 403 (the gate's own answer); a source agent belonging to
+   * another tenant stays the 400 `docs/API.md` §Grants specifies, so that one
+   * is logged and then left to `grants.ts` to refuse.
+   */
+  async createGrant(input: GrantInput, byOwner: string): Promise<PolicyGrant> {
+    await this.assertAgentOwnership(input.toAgent, byOwner, "api:POST");
+    const source =
+      input.fromAgent === null
+        ? undefined
+        : this.store.snapshot().agents.find((item) => item.id === input.fromAgent);
+    if (source && source.ownerId !== byOwner) {
+      await this.logCrossTenant(source.id, byOwner, "api:POST", "agent/" + source.id);
+    }
+    return createGrant(this.store, input, byOwner);
+  }
+
+  async revokeGrant(grantId: string, byOwner: string): Promise<PolicyGrant> {
+    return revokeGrant(this.store, grantId, byOwner);
+  }
+
+  listApprovals(ownerId: string): ApprovalRequest[] {
+    return listApprovals(this.store, ownerId);
+  }
+
+  async decideApproval(
+    approvalId: string,
+    decision: ApprovalDecision,
+    byOwner: string,
+  ): Promise<ApprovalRequest> {
+    return decideApproval(this.store, approvalId, decision, byOwner);
+  }
+
+  /**
+   * The run timeline. `policy` is the default because that is the story the
+   * demo tells; `all` adds what the agent actually did in between.
+   */
+  getRunEvents(runId: string, filter: EventFilter = "policy"): RunEvent[] {
+    this.getRun(runId);
+    return this.selectEvents((event) => event.runId === runId, filter);
+  }
+
+  /**
+   * The agent timeline, across runs. It keys on `agentId` rather than on the
+   * agent's runs on purpose: a cross-tenant denial names the agent but no run
+   * (`runId: null`, docs/SEAMS.md), so it can only ever surface here.
+   */
+  getAgentEvents(agentId: string, filter: EventFilter = "policy", limit = 200): RunEvent[] {
+    this.getAgent(agentId);
+    const rows = this.selectEvents((event) => event.agentId === agentId, filter);
+    // Drop from the front when the limit bites: the newest rows are the ones
+    // being watched, and the order stays oldest-first for the timeline.
+    return rows.slice(Math.max(0, rows.length - limit));
+  }
+
+  private selectEvents(match: (event: RunEvent) => boolean, filter: EventFilter): RunEvent[] {
+    return this.store
+      .snapshot()
+      .runEvents.filter(
+        (event) => match(event) && (filter === "all" || POLICY_EVENT_KINDS.includes(event.kind)),
+      )
+      .sort((left, right) => left.at.localeCompare(right.at));
+  }
+
   async sendMessage(
     agentId: string,
     prompt: string,
@@ -186,7 +488,9 @@ export class AgentService {
       content: prompt,
       createdAt: timestamp,
     };
-    const agentAtStart = await this.store.mutate((database) => {
+    // The token row and the run are written in one mutation: a run that exists
+    // without an identity would be a run the gateway cannot check.
+    const { agent: agentAtStart, runToken } = await this.store.mutate((database) => {
       const storedAgent = database.agents.find((item) => item.id === agentId);
       if (!storedAgent) {
         throw new HttpError(404, "Agent not found");
@@ -199,13 +503,28 @@ export class AgentService {
       }
       database.runs.push(run);
       database.messages.push(message);
+      const token: RunToken = {
+        jti: randomUUID(),
+        runId,
+        agentId,
+        ownerId: storedAgent.ownerId,
+        // tools ∪ live tempScopes, so an "Allow for this run" grant survives into
+        // the follow-up message's run (docs/SEAMS.md).
+        scp: effectiveScopes(storedAgent, timestamp),
+        taints: [],
+        issuedAt: timestamp,
+        expiresAt: new Date(Date.parse(timestamp) + this.config.codexTimeoutMs + 60_000)
+          .toISOString(),
+        revokedAt: null,
+      };
+      database.runTokens.push(token);
       const snapshot = structuredClone(storedAgent);
       storedAgent.status = "busy";
       storedAgent.lastError = null;
       storedAgent.updatedAt = timestamp;
-      return snapshot;
+      return { agent: snapshot, runToken: token };
     });
-    const execution = this.executeRun(agentAtStart, run);
+    const execution = this.executeRun(agentAtStart, run, runToken);
     this.activeExecutions.set(agentId, execution);
     void execution
       .finally(() => {
@@ -236,7 +555,11 @@ export class AgentService {
     };
   }
 
-  private async executeRun(agentAtStart: Agent, run: AgentRun): Promise<void> {
+  private async executeRun(
+    agentAtStart: Agent,
+    run: AgentRun,
+    runToken: RunToken,
+  ): Promise<void> {
     await this.store.mutate((database) => {
       const storedRun = database.runs.find((item) => item.id === run.id);
       if (storedRun) {
@@ -248,11 +571,28 @@ export class AgentService {
       if (this.cancellationRequests.has(agentAtStart.id)) {
         throw new RunCancelledError();
       }
+      // A snapshot of the row, not the authority: the gateway re-reads the row
+      // on every call so a revoke mid-run takes effect immediately.
+      const token = await signAgent(this.config, {
+        sub: runToken.agentId,
+        own: runToken.ownerId,
+        run: runToken.runId,
+        jti: runToken.jti,
+        scp: runToken.scp,
+        expiresInSeconds: Math.ceil(
+          (Date.parse(runToken.expiresAt) - Date.now()) / 1000,
+        ),
+      });
       const result = await this.runner.run({
         agentId: agentAtStart.id,
         workspacePath: agentAtStart.workspacePath,
         prompt: run.prompt,
         threadId: agentAtStart.codexThreadId,
+        token,
+        // tools comes from the token's scope set, not the agent's permanent tools:
+        // B2 builds Codex's enabled_tools from this, so an "Allow for this run"
+        // scope would otherwise never reach the model's menu (docs/SEAMS.md).
+        permissions: { ...agentAtStart.permissions, tools: runToken.scp },
       });
       const completedAt = now();
       await this.store.mutate((database) => {
@@ -276,6 +616,7 @@ export class AgentService {
         agent.lastError = null;
         agent.updatedAt = completedAt;
       });
+      await this.closeRunToken(runToken.jti);
     } catch (error) {
       const completedAt = now();
       const cancelled = error instanceof RunCancelledError;
@@ -296,7 +637,22 @@ export class AgentService {
           agent.updatedAt = completedAt;
         }
       });
+      await this.closeRunToken(runToken.jti);
     }
+  }
+
+  /**
+   * A run's identity dies with the run. Without this a cancelled or failed run leaves a
+   * usable token behind until its expiry, which can be most of CODEX_TIMEOUT_MS.
+   * Leaves an already-revoked row alone so the kill switch's timestamp survives.
+   */
+  private async closeRunToken(jti: string): Promise<void> {
+    await this.store.mutate((database) => {
+      const token = database.runTokens.find((item) => item.jti === jti);
+      if (token && !token.revokedAt) {
+        token.revokedAt = now();
+      }
+    });
   }
 
   private async setStatus(id: string, status: Agent["status"]): Promise<Agent> {
