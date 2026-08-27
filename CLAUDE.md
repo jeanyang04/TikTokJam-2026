@@ -2,6 +2,8 @@
 
 Read this fully before touching code. Then read `docs/PLAN.md` (design), `docs/TEAM.md` (who owns what), and skim `docs/DIAGRAMS.md`.
 
+**Read `docs/SEAMS.md` before adding an env var, signing or verifying a token, reading the caller's identity, or editing a file `docs/TEAM.md` assigns to someone else** — it records what already landed on the shared seams, and where the code deviates from `PLAN.md` on purpose. Add an entry there when you land something another owner builds on.
+
 ## What this repo is
 The RrankPyramid/CodeJam starter kit (React UI + Fastify control plane + Codex CLI running in a disposable Docker container per turn) plus our middleware for the **Identity & Authorization** track.
 
