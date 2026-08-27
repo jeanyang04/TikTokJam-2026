@@ -88,7 +88,7 @@ async function mintedTokenFor(tools: Scope[]) {
     workspaceRoot,
     verifyAgentToken: makeJwtVerifier(SECRET),
   });
-  return { app, store, agent, runner, token: runner.request?.token ?? "", run };
+  return { app, store, service, agent, runner, token: runner.request?.token ?? "", run };
 }
 
 async function call(
@@ -157,6 +157,25 @@ describe("a minted run identity at the gateway", () => {
 
     // The JWT is unchanged and still unexpired. The row is the authority.
     expect((await call(app, token, "workspace_read", args)).isError).toBe(true);
+  });
+
+  it("stops working the moment the operator hits Kill, mid-run", async () => {
+    const { app, store, service, token, agent, runner } =
+      await mintedTokenFor(["workspace:read"]);
+    const args = { agent: agent.id, path: "notes.md" };
+    expect((await call(app, token, "workspace_read", args)).isError).toBe(false);
+
+    // Scene 5's other half: the run is still open — `runner` has not finished —
+    // and the operator kills the identity out from under it.
+    await service.killAgent(agent.id, "user-jean");
+
+    const refused = await call(app, token, "workspace_read", args);
+    expect(refused.isError).toBe(true);
+    expect(store.snapshot().runEvents.at(-1)).toMatchObject({
+      decision: "deny",
+      reason: "revoked",
+    });
+    runner.finish();
   });
 
   it("stops working once the run it belongs to has ended", async () => {

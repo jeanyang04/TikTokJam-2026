@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { afterEach, describe, expect, it } from "vitest";
 import { JsonStore } from "./store.js";
 import { cleanupHarnesses, makeHarness as harness } from "./test-harness.js";
-import type { Agent, RunToken } from "./types.js";
+import type { Agent, ApprovalRequest, RunToken } from "./types.js";
 
 const makeHarness = () => harness("launchpad-kill-");
 
@@ -28,6 +28,30 @@ async function seedToken(
   };
   await store.mutate((database) => database.runTokens.push(token));
   return token;
+}
+
+/** A pending scope card, as the gateway writes it on a deny. */
+async function seedCard(store: JsonStore, agent: Agent): Promise<ApprovalRequest> {
+  const card: ApprovalRequest = {
+    id: randomUUID(),
+    source: "live_deny",
+    kind: "scope",
+    agentId: agent.id,
+    ownerId: agent.ownerId,
+    runId: null,
+    jti: null,
+    resource: agent.ownerId + "/crm",
+    action: "read",
+    scope: "crm:read",
+    grant: null,
+    reason: "scope",
+    status: "pending",
+    createdAt: new Date().toISOString(),
+    decidedAt: null,
+    decidedBy: null,
+  };
+  await store.mutate((database) => database.approvals.push(card));
+  return card;
 }
 
 describe("Kill switch", () => {
@@ -107,7 +131,7 @@ describe("Kill switch", () => {
   it("writes the operator's row, shaped by docs/API.md", async () => {
     const { app, service, store, as } = await makeHarness();
     const agent = await service.createAgent({ name: "Researcher" }, "user-jean");
-    await seedToken(store, agent);
+    const token = await seedToken(store, agent);
 
     await app.inject({
       method: "POST",
@@ -122,8 +146,52 @@ describe("Kill switch", () => {
       resource: "agent/" + agent.id,
       decision: "deny",
       reason: "revoked-by-operator",
-      runId: null,
+      // Named, so the run's own timeline can show why it stopped: the gateway
+      // audits the call it refuses before it has an identity to attribute.
+      runId: token.runId,
     });
+    await app.close();
+  });
+
+  it("names no run when the kill did not interrupt exactly one", async () => {
+    const { app, service, store, as } = await makeHarness();
+    const agent = await service.createAgent({ name: "Researcher" }, "user-jean");
+    await seedToken(store, agent);
+    await seedToken(store, agent);
+
+    await app.inject({
+      method: "POST",
+      url: "/api/agents/" + agent.id + "/kill",
+      headers: await as("user-jean"),
+    });
+
+    expect(store.snapshot().runEvents.at(-1)).toMatchObject({ action: "kill", runId: null });
+    await app.close();
+  });
+
+  it("refuses the cards still pending, so Always allow cannot resurrect the agent", async () => {
+    const { app, service, store, as } = await makeHarness();
+    const agent = await service.createAgent({ name: "Researcher" }, "user-jean");
+    const card = await seedCard(store, agent);
+    const jean = await as("user-jean");
+
+    await app.inject({
+      method: "POST",
+      url: "/api/agents/" + agent.id + "/kill",
+      headers: jean,
+    });
+
+    expect(store.snapshot().approvals[0]).toMatchObject({ id: card.id, status: "deny" });
+
+    // The operator answering a stale card must not write the scope back.
+    const late = await app.inject({
+      method: "POST",
+      url: "/api/approvals/" + card.id + "/decide",
+      headers: jean,
+      payload: { decision: "allow_always" },
+    });
+    expect(late.statusCode).toBe(409);
+    expect(service.getAgent(agent.id).permissions.tools).toEqual([]);
     await app.close();
   });
 

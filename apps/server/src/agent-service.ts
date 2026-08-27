@@ -25,6 +25,17 @@ import { WorkspaceManager } from "./workspace.js";
 
 const now = () => new Date().toISOString();
 
+/**
+ * Revocation narrows and never widens: an already-revoked row keeps its first
+ * timestamp, because *when* an identity died is the evidence. The run ending and
+ * the operator's Kill switch both come through here so the rule is stated once.
+ */
+function revokeToken(token: RunToken, at: string): void {
+  if (!token.revokedAt) {
+    token.revokedAt = at;
+  }
+}
+
 export type EventFilter = "policy" | "all";
 /** `docs/API.md` §Events: what a human decided or the gateway enforced. */
 const POLICY_EVENT_KINDS: RunEventKind[] = ["gateway", "approval", "grant"];
@@ -308,40 +319,63 @@ export class AgentService {
    * Runs regardless of status: a PATCH mid-run is an edit that can wait, a kill
    * cannot. The container is left alone — Stop is what kills the process.
    */
-  async killAgent(agentId: string, byOwner: string): Promise<Agent> {
-    const killed = await this.store.mutate((database) => {
+  async killAgent(agentId: string, callerId: string): Promise<Agent> {
+    const { agent: killed, runIds } = await this.store.mutate((database) => {
       const agent = database.agents.find((item) => item.id === agentId);
       if (!agent) {
         throw new HttpError(404, "Agent not found");
       }
       const timestamp = now();
+      const revoked: string[] = [];
       for (const token of database.runTokens) {
-        // An already-revoked row keeps its own timestamp: when the identity died
-        // is evidence, and a second kill should not rewrite the first one.
         if (token.agentId === agentId && !token.revokedAt) {
-          token.revokedAt = timestamp;
+          revoked.push(token.runId);
+        }
+        if (token.agentId === agentId) {
+          revokeToken(token, timestamp);
         }
       }
       agent.permissions = { ...agent.permissions, tools: [] };
       agent.tempScopes = [];
       agent.updatedAt = timestamp;
-      return structuredClone(agent);
+      return { agent: structuredClone(agent), runIds: revoked };
     });
+    // Before the summary row, so the kill is the last word in the timeline.
+    const voidedCards = await this.voidPendingCards(agentId, callerId);
     await recordEvent(this.store, {
-      // `runId` stays null like every other API row: the operator's click is not
-      // part of a run. The run timeline gets its evidence from the gateway, which
-      // logs the refused call itself with reason `revoked`.
-      runId: null,
+      // Unlike every other API row this one names a run, because the run timeline
+      // has no other honest record of the kill: `gateway.ts` audits the refused
+      // call it causes before it has a verified identity, so that row lands as
+      // `agentId: "unknown"` with no run. **Zeon:** auditing the revoked branch
+      // from the claims would attribute it, and this could go back to null.
+      runId: runIds.length === 1 ? (runIds[0] ?? null) : null,
       agentId,
-      ownerId: byOwner,
+      ownerId: callerId,
       kind: "gateway",
       action: "kill",
       resource: "agent/" + agentId,
       decision: "deny",
       reason: "revoked-by-operator",
-      detail: {},
+      detail: { revokedRuns: runIds, voidedCards },
     });
     return killed;
+  }
+
+  /**
+   * A card the agent provoked before the kill would otherwise still be sitting in
+   * the operator's queue, and answering it with "Always allow" writes straight
+   * back into `permissions.tools` — resurrecting the identity that was killed.
+   * They are refused through `decideApproval`, so each one lands in the audit
+   * trail as the decision it now is.
+   */
+  private async voidPendingCards(agentId: string, callerId: string): Promise<number> {
+    const pending = this.store
+      .snapshot()
+      .approvals.filter((card) => card.agentId === agentId && card.status === "pending");
+    for (const card of pending) {
+      await decideApproval(this.store, card.id, "deny", callerId);
+    }
+    return pending.length;
   }
 
   /**

@@ -213,9 +213,22 @@ next run and the kill would not be a kill. **Zeon:** the contract line wants the
 clause; flagging rather than editing `API.md`.
 
 **A kill mid-run is refused by `gateway.ts:95`,** which reads `revokedAt` off the row on
-every call and answers `403 revoked`. That is where the run timeline's evidence comes from,
-so `killAgent`'s own row carries `runId: null` like every other API row — the operator's
-click is not part of a run.
+every call and answers `403 revoked`. Pinned end to end in `run-identity.test.ts`: same
+token, run still open, `403 revoked`.
+
+**The kill row names the run, and it is the only API row that does.** `gateway.ts:272`
+audits the refusal it causes from `authenticate`'s failure path, before there is a verified
+identity, so that row lands as `agentId: "unknown"`, `runId: null` and reaches no timeline.
+Without a run on the kill row, nothing in the run's own timeline says why it stopped. The
+row therefore carries the revoked token's `runId` when the kill interrupted exactly one
+run, and `null` otherwise. **Zeon:** auditing the revoked branch from the claims would
+attribute it properly, and then this can go back to `null` like every other API row.
+
+**Pending cards are refused as part of the kill.** A card the agent provoked before the
+kill is still in the operator's queue afterwards, and `allow_always` writes straight into
+`permissions.tools` (`approvals.ts:55`) — answering a stale card would resurrect the
+identity that was killed. `killAgent` denies them through `decideApproval`, so each lands
+in the audit trail as the decision it now is, and a late click gets the 409.
 
 **No busy guard, unlike PATCH.** A `409` here would mean the kill switch stops working
 exactly when it is needed. The container is left running; Stop is what kills the process
