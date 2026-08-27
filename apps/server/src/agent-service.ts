@@ -316,6 +316,7 @@ export class AgentService {
         agent.lastError = null;
         agent.updatedAt = completedAt;
       });
+      await this.closeRunToken(runToken.jti);
     } catch (error) {
       const completedAt = now();
       const cancelled = error instanceof RunCancelledError;
@@ -336,7 +337,22 @@ export class AgentService {
           agent.updatedAt = completedAt;
         }
       });
+      await this.closeRunToken(runToken.jti);
     }
+  }
+
+  /**
+   * A run's identity dies with the run. Without this a cancelled or failed run leaves a
+   * usable token behind until its expiry, which can be most of CODEX_TIMEOUT_MS.
+   * Leaves an already-revoked row alone so the kill switch's timestamp survives.
+   */
+  private async closeRunToken(jti: string): Promise<void> {
+    await this.store.mutate((database) => {
+      const token = database.runTokens.find((item) => item.jti === jti);
+      if (token && !token.revokedAt) {
+        token.revokedAt = now();
+      }
+    });
   }
 
   private async setStatus(id: string, status: Agent["status"]): Promise<Agent> {

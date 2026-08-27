@@ -170,6 +170,7 @@ describe("RunToken mint", () => {
     const { run } = await service.sendMessage(agent.id, "read the notes");
 
     const tokens = store.snapshot().runTokens;
+    // The row is there the moment sendMessage returns, before the run finishes.
     expect(tokens).toHaveLength(1);
     expect(tokens[0]).toMatchObject({
       runId: run.id,
@@ -180,6 +181,8 @@ describe("RunToken mint", () => {
       revokedAt: null,
     });
     expect(tokens[0]?.jti).toBeTruthy();
+    // Let the run settle so teardown doesn't race the store's writes.
+    await expect.poll(() => service.getRun(run.id).status).toBe("completed");
   });
 
   it("hands the runner an agent JWT matching that row", async () => {
@@ -235,14 +238,13 @@ describe("RunToken mint", () => {
   it("expires the row a minute past the Codex timeout", async () => {
     const { service, store, config } = await makeHarness();
     const agent = await service.createAgent({ name: "Researcher" });
-    const before = Date.now();
-    await service.sendMessage(agent.id, "hello");
+    const { run } = await service.sendMessage(agent.id, "hello");
 
     const [row] = store.snapshot().runTokens;
-    const expiry = Date.parse(row!.expiresAt);
-    const expected = before + config.codexTimeoutMs + 60_000;
-    expect(expiry).toBeGreaterThanOrEqual(expected);
-    expect(expiry).toBeLessThan(expected + 10_000);
+    expect(Date.parse(row!.expiresAt) - Date.parse(row!.issuedAt)).toBe(
+      config.codexTimeoutMs + 60_000,
+    );
+    await expect.poll(() => service.getRun(run.id).status).toBe("completed");
   });
 
   it("carries an 'Allow for this run' scope into the next run's token", async () => {
@@ -267,6 +269,31 @@ describe("RunToken mint", () => {
     // B2 turns this into Codex's enabled_tools, so the widened scope has to be here
     // too or the model never sees the tool it was just allowed.
     expect(runner.request?.permissions?.tools).toEqual(["workspace:read", "crm:read"]);
+  });
+
+  it("revokes the row when the run completes", async () => {
+    const { service, store } = await makeHarness();
+    const agent = await service.createAgent({ name: "Researcher" });
+    const { run } = await service.sendMessage(agent.id, "hello");
+    await expect.poll(() => service.getRun(run.id).status).toBe("completed");
+
+    expect(store.snapshot().runTokens[0]?.revokedAt).toBeTruthy();
+  });
+
+  it("revokes the row when the run fails", async () => {
+    const failing: AgentRunner = {
+      run: async () => {
+        throw new Error("codex exploded");
+      },
+      cancel: async () => false,
+      isAvailable: async () => true,
+    };
+    const { service, store } = await makeHarness(failing);
+    const agent = await service.createAgent({ name: "Researcher" });
+    const { run } = await service.sendMessage(agent.id, "hello");
+    await expect.poll(() => service.getRun(run.id).status).toBe("failed");
+
+    expect(store.snapshot().runTokens[0]?.revokedAt).toBeTruthy();
   });
 
   it("mints one token per run", async () => {
