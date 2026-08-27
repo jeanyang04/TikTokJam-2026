@@ -103,7 +103,10 @@ describe("Grant routes", () => {
     });
 
     // The source agent is Jean's: a 400 by contract (D7), and audited all the
-    // same — reaching for another tenant's workspace is the attempt worth seeing.
+    // same — reaching for another tenant's workspace is the attempt worth
+    // seeing. Counted, because this row looks exactly like the one above: an
+    // assertion on `at(-1)` alone would pass by re-reading it.
+    const afterFirst = store.snapshot().runEvents.length;
     const crossTenant = await app.inject({
       method: "POST",
       url: "/api/grants",
@@ -116,6 +119,7 @@ describe("Grant routes", () => {
       },
     });
     expect(crossTenant.statusCode).toBe(400);
+    expect(store.snapshot().runEvents).toHaveLength(afterFirst + 1);
     expect(store.snapshot().runEvents.at(-1)).toMatchObject({
       agentId: jeans.id,
       ownerId: "user-alex",

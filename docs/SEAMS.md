@@ -190,7 +190,8 @@ intra-tenant only). **The 403 and the 400 both write a RunEvent; the 404 does no
 ownership gate to guard, so `AgentService.createGrant` writes the row before delegating.
 CLAUDE.md rule 3 is about the *attempt*, not about which preHandler catches it — a
 cross-tenant reach at an agent that exists is audited whatever status code the contract
-gives it.
+gives it. **F: the row's `resource` is `agent/<id>` here, not `grant/<id>`** — a refused
+create reaches for an agent, a refused revoke for a grant.
 
 **`filter` defaults to `policy`** = kinds `gateway, approval, grant`; `all` adds
 `command, file_change, mcp_call, llm`. Both are ordered oldest-first by `at`.
