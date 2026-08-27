@@ -57,8 +57,10 @@ const grantBody = z.object({
 const decideBody = z.object({
   decision: z.enum(["allow_run", "allow_always", "deny"]),
 });
-const eventsQuery = z.object({
-  filter: z.enum(["policy", "all"]).default("policy"),
+// `limit` belongs to the agent timeline only: a run's events are bounded by the
+// run (`docs/API.md` §Events).
+const eventsQuery = z.object({ filter: z.enum(["policy", "all"]).default("policy") });
+const agentEventsQuery = eventsQuery.extend({
   limit: z.coerce.number().int().min(1).max(1000).default(200),
 });
 
@@ -264,7 +266,7 @@ export async function createApp(
 
   app.get("/api/agents/:id/events", async (request) => {
     const { id } = agentIdParams.parse(request.params);
-    const { filter, limit } = eventsQuery.parse(request.query);
+    const { filter, limit } = agentEventsQuery.parse(request.query);
     return { events: service.getAgentEvents(id, filter, limit) };
   });
 

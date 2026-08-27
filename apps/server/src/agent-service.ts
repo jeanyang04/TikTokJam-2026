@@ -165,6 +165,22 @@ export class AgentService {
     action: string,
     resource: string,
   ): Promise<never> {
+    await this.logCrossTenant(agentId, callerId, action, resource);
+    throw new HttpError(403, "That resource belongs to another tenant");
+  }
+
+  /**
+   * The row on its own, for the one caller that must record the attempt but
+   * answer something other than 403 (`createGrant`, whose cross-tenant *source*
+   * is a 400 by contract). Every cross-tenant refusal is audited; not every one
+   * is a 403.
+   */
+  private async logCrossTenant(
+    agentId: string,
+    callerId: string,
+    action: string,
+    resource: string,
+  ): Promise<void> {
     await recordEvent(this.store, {
       runId: null,
       agentId,
@@ -176,7 +192,6 @@ export class AgentService {
       reason: "cross-tenant",
       detail: {},
     });
-    throw new HttpError(403, "That resource belongs to another tenant");
   }
 
   // ownerId is threaded from request.principal by B1 (auth.ts); default keeps the baseline working.
@@ -290,7 +305,23 @@ export class AgentService {
     return listGrants(this.store, agentId);
   }
 
+  /**
+   * `createGrant` refuses both cross-tenant reaches itself, but silently, and
+   * `POST /api/grants` names no id for the ownership gate to guard — so the
+   * audit row CLAUDE.md rule 3 requires is written here, before delegating.
+   * The recipient is a 403 (the gate's own answer); a source agent belonging to
+   * another tenant stays the 400 `docs/API.md` §Grants specifies, so that one
+   * is logged and then left to `grants.ts` to refuse.
+   */
   async createGrant(input: GrantInput, byOwner: string): Promise<PolicyGrant> {
+    await this.assertAgentOwnership(input.toAgent, byOwner, "api:POST");
+    const source =
+      input.fromAgent === null
+        ? undefined
+        : this.store.snapshot().agents.find((item) => item.id === input.fromAgent);
+    if (source && source.ownerId !== byOwner) {
+      await this.logCrossTenant(source.id, byOwner, "api:POST", "agent/" + source.id);
+    }
     return createGrant(this.store, input, byOwner);
   }
 

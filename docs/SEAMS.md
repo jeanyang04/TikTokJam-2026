@@ -185,7 +185,12 @@ has no source agent). Sending `{}` is a 400, not a CRM grant.
 
 **Grant failures split three ways, and F should render them apart:** `404` unknown agent ·
 `403` the recipient is not yours · `400` the source agent is another tenant's (D7,
-intra-tenant only).
+intra-tenant only). **The 403 and the 400 both write a RunEvent; the 404 does not.**
+`createGrant` refuses both cross-tenant reaches silently, and the route names no id for the
+ownership gate to guard, so `AgentService.createGrant` writes the row before delegating.
+CLAUDE.md rule 3 is about the *attempt*, not about which preHandler catches it — a
+cross-tenant reach at an agent that exists is audited whatever status code the contract
+gives it.
 
 **`filter` defaults to `policy`** = kinds `gateway, approval, grant`; `all` adds
 `command, file_change, mcp_call, llm`. Both are ordered oldest-first by `at`.

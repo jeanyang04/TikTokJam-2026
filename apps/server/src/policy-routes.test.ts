@@ -1,82 +1,12 @@
-import { mkdtemp, rm } from "node:fs/promises";
-import path from "node:path";
 import { randomUUID } from "node:crypto";
-import { tmpdir } from "node:os";
 import { afterEach, describe, expect, it } from "vitest";
-import { AgentService } from "./agent-service.js";
-import { createApp } from "./app.js";
-import { signHuman } from "./auth.js";
-import type { AppConfig } from "./config.js";
-import { loadConfig } from "./config.js";
 import { JsonStore } from "./store.js";
-import type {
-  Agent,
-  AgentRunner,
-  ApprovalRequest,
-  PolicyGrant,
-  RunEvent,
-  RunnerRequest,
-  RunnerResult,
-} from "./types.js";
-import { WorkspaceManager } from "./workspace.js";
+import { cleanupHarnesses, makeHarness as harness, UNKNOWN_ID } from "./test-harness.js";
+import type { Agent, ApprovalRequest, PolicyGrant, RunEvent } from "./types.js";
 
-class FakeRunner implements AgentRunner {
-  async run(request: RunnerRequest): Promise<RunnerResult> {
-    return { output: "Completed: " + request.prompt, threadId: "fake-thread", usage: null };
-  }
-  async cancel(): Promise<boolean> {
-    return false;
-  }
-  async isAvailable(): Promise<boolean> {
-    return true;
-  }
-}
+const makeHarness = () => harness("launchpad-policy-");
 
-const temporaryDirectories: string[] = [];
-
-afterEach(async () => {
-  await Promise.all(
-    temporaryDirectories.splice(0).map((directory) =>
-      rm(directory, { recursive: true, force: true }),
-    ),
-  );
-});
-
-interface Harness {
-  app: Awaited<ReturnType<typeof createApp>>;
-  service: AgentService;
-  store: JsonStore;
-  config: AppConfig;
-  as: (userId: string) => Promise<{ authorization: string }>;
-}
-
-async function makeHarness(): Promise<Harness> {
-  const root = await mkdtemp(path.join(tmpdir(), "launchpad-policy-"));
-  temporaryDirectories.push(root);
-  const config = loadConfig({
-    NODE_ENV: "test",
-    APP_DATA_DIR: path.join(root, "data"),
-    AGENT_WORKSPACE_ROOT: path.join(root, "workspaces"),
-    CODEX_HOME: path.join(root, "codex"),
-    ARK_API_KEY: "test-key",
-    ARK_MODEL: "ep-test",
-  });
-  const store = new JsonStore(path.join(root, "data", "db.json"));
-  const service = new AgentService(
-    config,
-    store,
-    new WorkspaceManager(path.join(root, "workspaces")),
-    new FakeRunner(),
-  );
-  await service.initialize();
-  const app = await createApp(config, service);
-  const as = async (userId: string) => ({
-    authorization: "Bearer " + (await signHuman(config, userId)),
-  });
-  return { app, service, store, config, as };
-}
-
-const UNKNOWN_ID = "00000000-0000-4000-8000-000000000000";
+afterEach(cleanupHarnesses);
 
 /** A pending card, shaped as the gateway writes it on a scope deny. */
 async function seedCard(
@@ -149,8 +79,8 @@ describe("Grant routes", () => {
     await app.close();
   });
 
-  it("refuses a grant to someone else's agent, and one across tenants", async () => {
-    const { app, service, as } = await makeHarness();
+  it("refuses a grant to someone else's agent, and one across tenants, auditing both", async () => {
+    const { app, service, store, as } = await makeHarness();
     const jeans = await service.createAgent({ name: "Writer" }, "user-jean");
     const alexs = await service.createAgent({ name: "Alex-1" }, "user-alex");
     const alex = await as("user-alex");
@@ -162,7 +92,18 @@ describe("Grant routes", () => {
       payload: { fromAgent: null, toAgent: jeans.id, resource: "crm", actions: ["read"] },
     });
     expect(notYours.statusCode).toBe(403);
+    // CLAUDE.md rule 3: this route names no id for the gate to guard, so the row
+    // has to come from somewhere. It reaches an agent that exists.
+    expect(store.snapshot().runEvents.at(-1)).toMatchObject({
+      agentId: jeans.id,
+      ownerId: "user-alex",
+      resource: "agent/" + jeans.id,
+      decision: "deny",
+      reason: "cross-tenant",
+    });
 
+    // The source agent is Jean's: a 400 by contract (D7), and audited all the
+    // same — reaching for another tenant's workspace is the attempt worth seeing.
     const crossTenant = await app.inject({
       method: "POST",
       url: "/api/grants",
@@ -175,6 +116,22 @@ describe("Grant routes", () => {
       },
     });
     expect(crossTenant.statusCode).toBe(400);
+    expect(store.snapshot().runEvents.at(-1)).toMatchObject({
+      agentId: jeans.id,
+      ownerId: "user-alex",
+      resource: "agent/" + jeans.id,
+      reason: "cross-tenant",
+    });
+
+    const before = store.snapshot().runEvents.length;
+    const unknown = await app.inject({
+      method: "POST",
+      url: "/api/grants",
+      headers: alex,
+      payload: { fromAgent: null, toAgent: UNKNOWN_ID, resource: "crm", actions: ["read"] },
+    });
+    expect(unknown.statusCode).toBe(404);
+    expect(store.snapshot().runEvents).toHaveLength(before);
     await app.close();
   });
 

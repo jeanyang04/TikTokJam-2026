@@ -1,73 +1,9 @@
-import { mkdtemp, rm } from "node:fs/promises";
-import path from "node:path";
-import { tmpdir } from "node:os";
 import { afterEach, describe, expect, it } from "vitest";
-import { AgentService } from "./agent-service.js";
-import { createApp } from "./app.js";
-import { signHuman } from "./auth.js";
-import type { AppConfig } from "./config.js";
-import { loadConfig } from "./config.js";
-import { JsonStore } from "./store.js";
-import type { AgentRunner, RunnerRequest, RunnerResult } from "./types.js";
-import { WorkspaceManager } from "./workspace.js";
+import { cleanupHarnesses, makeHarness as harness, UNKNOWN_ID } from "./test-harness.js";
 
-class FakeRunner implements AgentRunner {
-  async run(request: RunnerRequest): Promise<RunnerResult> {
-    return { output: "Completed: " + request.prompt, threadId: "fake-thread", usage: null };
-  }
-  async cancel(): Promise<boolean> {
-    return false;
-  }
-  async isAvailable(): Promise<boolean> {
-    return true;
-  }
-}
+const makeHarness = () => harness("launchpad-own-");
 
-const temporaryDirectories: string[] = [];
-
-afterEach(async () => {
-  await Promise.all(
-    temporaryDirectories.splice(0).map((directory) =>
-      rm(directory, { recursive: true, force: true }),
-    ),
-  );
-});
-
-interface Harness {
-  app: Awaited<ReturnType<typeof createApp>>;
-  service: AgentService;
-  store: JsonStore;
-  config: AppConfig;
-  as: (userId: string) => Promise<{ authorization: string }>;
-}
-
-async function makeHarness(): Promise<Harness> {
-  const root = await mkdtemp(path.join(tmpdir(), "launchpad-own-"));
-  temporaryDirectories.push(root);
-  const config = loadConfig({
-    NODE_ENV: "test",
-    APP_DATA_DIR: path.join(root, "data"),
-    AGENT_WORKSPACE_ROOT: path.join(root, "workspaces"),
-    CODEX_HOME: path.join(root, "codex"),
-    ARK_API_KEY: "test-key",
-    ARK_MODEL: "ep-test",
-  });
-  const store = new JsonStore(path.join(root, "data", "db.json"));
-  const service = new AgentService(
-    config,
-    store,
-    new WorkspaceManager(path.join(root, "workspaces")),
-    new FakeRunner(),
-  );
-  await service.initialize();
-  const app = await createApp(config, service);
-  const as = async (userId: string) => ({
-    authorization: "Bearer " + (await signHuman(config, userId)),
-  });
-  return { app, service, store, config, as };
-}
-
-const UNKNOWN_ID = "00000000-0000-4000-8000-000000000000";
+afterEach(cleanupHarnesses);
 
 describe("Ownership enforcement", () => {
   it("refuses another tenant's agent with 403 and an audit event", async () => {
