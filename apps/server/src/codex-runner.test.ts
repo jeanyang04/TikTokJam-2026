@@ -87,6 +87,29 @@ describe("Codex runner protocol", () => {
     expect(enabledTools).not.toContain('"webhook_send"');
   });
 
+  it("does not let a migrated permission widen a globally read-only sandbox", () => {
+    const args = buildCodexArgs(
+      {
+        agentId: "agent",
+        workspacePath: "/tmp/workspace",
+        prompt: "inspect only",
+        threadId: null,
+        permissions: {
+          sandbox: "workspace-write",
+          network: false,
+          webSearch: false,
+          tools: [],
+        },
+      },
+      "read-only",
+      "http://127.0.0.1:3000",
+    );
+
+    expect(args).toContain("read-only");
+    expect(args).not.toContain("workspace-write");
+    expect(args).toContain('sandbox_mode="read-only"');
+  });
+
   it("extracts the session, final message and usage", () => {
     const parsed = {
       messages: [] as string[],

@@ -36,13 +36,31 @@ function tomlStringArray(values: string[]): string {
   return "[" + values.map(tomlString).join(",") + "]";
 }
 
+const SANDBOX_RANK: Record<AppConfig["codexSandboxMode"], number> = {
+  "read-only": 0,
+  "workspace-write": 1,
+  "danger-full-access": 2,
+};
+
+function effectiveSandboxMode(
+  configured: AppConfig["codexSandboxMode"],
+  requested: RunnerRequest["permissions"],
+): AppConfig["codexSandboxMode"] {
+  if (!requested) return configured;
+  return SANDBOX_RANK[requested.sandbox] <= SANDBOX_RANK[configured]
+    ? requested.sandbox
+    : configured;
+}
+
 export function buildCodexArgs(
   request: RunnerRequest,
   sandboxMode: AppConfig["codexSandboxMode"],
   gatewayUrl: string,
   workspacePath = request.workspacePath,
 ): string[] {
-  const effectiveSandbox = request.permissions?.sandbox ?? sandboxMode;
+  // The process-wide setting is a ceiling. In particular, migrated agents
+  // default to workspace-write and must not widen an operator's read-only runtime.
+  const effectiveSandbox = effectiveSandboxMode(sandboxMode, request.permissions);
   const args = [
     "exec",
     "--json",
@@ -56,7 +74,7 @@ export function buildCodexArgs(
   if (request.permissions) {
     args.push(
       "-c",
-      "sandbox_mode=" + tomlString(request.permissions.sandbox),
+      "sandbox_mode=" + tomlString(effectiveSandbox),
       "-c",
       "sandbox_workspace_write.network_access=" + request.permissions.network,
       "-c",
