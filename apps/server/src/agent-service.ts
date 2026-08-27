@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { AppConfig } from "./config.js";
 import { isArkConfigured } from "./config.js";
 import { HttpError, RunCancelledError } from "./errors.js";
-import { JsonStore } from "./store.js";
+import { DEFAULT_PERMISSIONS, JsonStore } from "./store.js";
 import type {
   Agent,
   AgentRun,
@@ -60,7 +60,8 @@ export class AgentService {
     return agent;
   }
 
-  async createAgent(input: CreateAgentInput): Promise<Agent> {
+  // ownerId is threaded from request.principal by B1 (auth.ts); default keeps the baseline working.
+  async createAgent(input: CreateAgentInput, ownerId = "user-jean"): Promise<Agent> {
     const timestamp = now();
     const id = randomUUID();
     const agent: Agent = {
@@ -68,6 +69,9 @@ export class AgentService {
       name: input.name.trim(),
       description: input.description?.trim() ?? "",
       instructions: input.instructions?.trim() ?? "",
+      ownerId,
+      permissions: { ...DEFAULT_PERMISSIONS, ...(input.permissions ?? {}) },
+      tempScopes: [],
       status: "ready",
       workspacePath: this.workspaces.workspacePath(id),
       codexThreadId: null,
