@@ -256,6 +256,21 @@ describe("POST /api/grants/parse", () => {
     // One pending decision per access: the operator must not see two cards for
     // the same grant because it was asked for twice.
     expect(harness.store.snapshot().approvals).toHaveLength(1);
+
+    // Scene 1 into Scene 3, in the demo's own order: the card the parse call
+    // handed back still carries its run, so it takes the ordinary gateway path
+    // and writes the grant.
+    const decided = await harness.app.inject({
+      method: "POST",
+      url: "/api/approvals/" + live.id + "/decide",
+      headers: await harness.as("user-jean"),
+      payload: { decision: "allow_always" },
+    });
+
+    expect(decided.statusCode).toBe(200);
+    expect(harness.store.snapshot().policyGrants).toMatchObject([
+      { fromAgent: writer.id, toAgent: researcher.id, resource: "workspace", revokedAt: null },
+    ]);
   });
 
   it("cannot name another tenant's agent, so it 404s before any card exists", async () => {

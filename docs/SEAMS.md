@@ -357,6 +357,12 @@ grant from the narrower button. `AgentService.decideApproval` fails closed inste
 reason these cards cannot take all three buttons. Gateway cards, which always carry a
 `jti`, are untouched by the guard.
 
+**The guard names `kind:"grant"`, and that is not because the scope branch is safe.** It
+reads `card.jti` too; it merely has the fallback the grant branch lacks. The guard is
+narrow only because `gateway.ts` is today the sole source of `kind:"scope"` cards and it
+always passes `ctx.jti`. **If you add a card source that can mint a scope card without a
+run, widen this guard with it.**
+
 **Names resolve inside the caller's own agents, and this route can reach no others.** Agent
 names are not unique between tenants, so a store-wide lookup would mis-hit (Alex may also
 have a "Writer") and would answer whether another tenant owns a given name. Filtering to
