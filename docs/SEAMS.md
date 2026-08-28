@@ -260,33 +260,52 @@ file at the repo root is outside every tsconfig: `npm run typecheck` and `npm ru
 would both skip it and vitest would not collect `seed.test.ts` next to it, so the one gate
 CLAUDE.md rule 1 names could not see the code. The npm script keeps TEAM.md's entry point.
 
-**Re-running is a rehearsal reset, not just a no-op.** Ids survive (grants, RunTokens and
-RunEvents all reference them), and `permissions.tools`, `tempScopes` and any live grant
-touching the cast go back to the baseline — otherwise run-through two starts with Scene 1's
-"Always allow" already answered and the first scene has nothing to deny. Agents outside the
-cast, and the whole audit trail, are untouched: the store is never truncated.
+**Re-running is a rehearsal reset as well as a no-op on the row count.** Ids survive
+(grants, RunTokens and RunEvents all reference them), while `permissions`, `tempScopes`,
+`codexThreadId` and grants wholly inside the cast go back to baseline. Otherwise
+run-through two starts with Scene 1's "Always allow" already answered, and with a Codex
+thread that remembers being denied and then allowed. Agents outside the cast and the whole
+audit trail are untouched; the store is never truncated.
+
+**Only grants with *both* ends in the cast are revoked.** A bystander agent granted read of
+Writer's workspace is somebody's real configuration, not leftover demo state, so the
+recipient has to be a cast agent too. A grant with `fromAgent: null` counts when its
+`fromOwner` is Jean or Alex, because that is the owner's own CRM.
+
+**It refuses while a cast agent is `busy`, with a 409.** The RunToken row is authoritative,
+so resetting under a live run would leave that run working and silently take the scopes off
+the *next* one. A reset that only half applies is worse than one that refuses. Writing rows
+directly rather than through `AgentService` is what makes this the only guard in the way,
+and it keeps the reset in one `store.mutate`.
 
 **The seeded scopes are load-bearing, so read `FIXTURE_AGENTS` before changing them.**
 Researcher gets `workspace:read` so Scene 1's deny is the missing *grant* (a card
 `allow_always` can answer) rather than a missing scope, and `webhook:send` so Scene 2's
-exfil attempt reaches the IFC check instead of stopping one step earlier. No grant is
-seeded — Scene 1 is what creates it, and Scene 2 consumes it.
+exfil attempt reaches the IFC check instead of stopping one step earlier.
 
-**It writes rows directly, not through `AgentService`.** One `store.mutate`, so a seed
-during a live run cannot trip the busy→409 guard, and no RunEvents: this is the operator
-setting the stage, not an action inside a run. `WorkspaceManager.create` uses
-`recursive: false` and would throw on the second run, so the directory is made here and
-only `AGENTS.md` and the fixture files are rewritten.
+**No grant and no RunToken are seeded, so `/demo/replay` does not work off a bare seed.**
+Scene 1 is what writes the Writer→Researcher grant and Scene 2 consumes it; seeding one
+would leave Scene 1 with nothing to deny. `demo.ts` also needs a live RunToken, which only
+a real run mints. Run Scene 1, then send Researcher a message, and the replay has both.
+**B2:** that is the order the fallback assumes.
 
-**`credentials.json`'s fake token is shaped like a JWT (`eyJ…`) on purpose.** B3's
-`redact.ts` scrubs that pattern, so the Scene 2 audit row shows `[redacted]` rather than
-the payload. **B3:** if the pattern list changes, this fixture is what proves it still
+**`credentials.json`'s fake token is shaped like a JWT (`eyJ…`) on purpose.** The pattern
+list that scrubs it is `PATTERNS` in `audit.ts` today, not the `redact.ts` `docs/TEAM.md`
+assigns to B3; `setRedactor()` is where that replacement lands. Either way the Scene 2
+audit row shows `[redacted]` rather than the payload, and `seed.test.ts` pins it, so
+flattening the fixture to a plainer fake value fails the suite instead of quietly putting
+the payload back in the trail. **B3:** that test is also what tells you the new list still
 bites on the demo path.
 
 **Users are not seeded, because there is nowhere to seed them.** `Database` has no users
 table; they come from `SEED_USERS` and are parsed at login. The seed instead *refuses* an
-owner that `SEED_USERS` does not contain, before writing anything — an agent stamped with
-an owner nobody can log in as is invisible to every session.
+owner that `SEED_USERS` does not contain, before writing anything: an agent stamped with an
+owner nobody can log in as is invisible to every session.
+
+**CRM rows are not seeded either.** `docs/TEAM.md`'s Day 2 line for the seed asks for
+them, but `crm_records` is Postgres and belongs to B3's `migrations/001_init.sql`, which
+seeds two rows for Jean and one for Alex. Seeding them from here would need a second
+connection and would duplicate that file's rows on every run.
 
 **`npm run poc` does not seed.** It exports `APP_DATA_DIR` / `AGENT_WORKSPACE_ROOT` into
 its own process only, so `npm run seed` from a second shell writes the *defaults*
