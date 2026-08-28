@@ -441,7 +441,10 @@ export class AgentService {
    * cross-tenant 403 to reach. That is a deliberate difference from the
    * id-addressed routes, where a 403 plus an audit row is the right answer.
    */
-  async parseGrantRequest(text: string, callerId: string): Promise<ApprovalRequest> {
+  async parseGrantRequest(
+    text: string,
+    callerId: string,
+  ): Promise<{ approval: ApprovalRequest; created: boolean }> {
     const intent = await this.intentParser(this.config, text);
     if (!intent) {
       throw new HttpError(422, "Could not read a grant out of that");
@@ -456,29 +459,40 @@ export class AgentService {
     };
 
     const to = byName(intent.toAgent);
-    const from = intent.fromAgent === null ? null : byName(intent.fromAgent);
+    const from = byName(intent.fromAgent);
+    const [action] = intent.actions;
+    const before = new Set(this.store.snapshot().approvals.map((item) => item.id));
     const card = await createCardOnDeny(this.store, {
       source: "nl_intent",
       kind: "grant",
       agentId: to.id,
       ownerId: callerId,
-      // No run raised this: the human asked for it directly, so there is no
-      // token to widen for and `allow_run` falls back to its own window.
+      // No run raised this: the human asked directly. `decideApproval` reads the
+      // run window off `jti`, which is why `allow_run` is refused for these
+      // cards until that branch has a fallback.
       runId: null,
       jti: null,
-      resource: (from?.name ?? callerId) + "/" + intent.resource,
-      action: intent.actions.join("+"),
+      // Deliberately byte-identical to `gateway.ts`'s `grantCard`, because
+      // `createCardOnDeny` dedupes on (agentId, kind, resource, action). Two
+      // formats for the same access would mean the operator sees two cards for
+      // one decision.
+      resource: from.name + "/workspace",
+      action,
       scope: null,
       grant: {
         fromOwner: callerId,
-        fromAgent: from?.id ?? null,
+        fromAgent: from.id,
         toAgent: to.id,
-        resource: intent.resource,
-        actions: intent.actions,
+        resource: "workspace",
+        actions: [action],
         egress: ["internal"],
       },
       reason: "requested in natural language",
     });
+    // Sharing the key means a live deny may already have raised this exact
+    // card. Returning it unchanged is right (one pending decision per access),
+    // but the route must not then claim it created something.
+    const created = !before.has(card.id);
     await recordEvent(this.store, {
       runId: null,
       agentId: to.id,
@@ -490,9 +504,9 @@ export class AgentService {
       // The text is the human's own prose and may contain anything, so its
       // length is all that goes in the trail (CLAUDE.md rule 4).
       reason: "nl_intent",
-      detail: { cardId: card.id, source: card.source, textLength: text.length },
+      detail: { cardId: card.id, source: card.source, created, textLength: text.length },
     });
-    return card;
+    return { approval: card, created };
   }
 
   async decideApproval(
@@ -500,6 +514,26 @@ export class AgentService {
     decision: ApprovalDecision,
     byOwner: string,
   ): Promise<ApprovalRequest> {
+    const card = this.store.snapshot().approvals.find((item) => item.id === approvalId);
+    // "Allow for this run" on a card that no run raised would write a
+    // *permanent* grant: `approvals.ts` reads the run window through `card.jti`
+    // and its grant branch has no fallback when that is null, unlike its scope
+    // branch. The narrower button must not produce the broader outcome, so this
+    // fails closed until that fallback exists. Ticket 08's nl_intent cards are
+    // the only ones with a null `jti`; gateway cards are untouched.
+    // **Zeon:** a `?? tenMinutesFromNow` in the grant branch retires this.
+    if (
+      card &&
+      card.ownerId === byOwner &&
+      decision === "allow_run" &&
+      card.kind === "grant" &&
+      card.jti === null
+    ) {
+      throw new HttpError(
+        409,
+        "No run to scope this to. Use Always allow, then revoke when you are done",
+      );
+    }
     return decideApproval(this.store, approvalId, decision, byOwner);
   }
 

@@ -266,10 +266,15 @@ export async function createApp(
   // Exempt from the ownership gate (`idlessRoutes`) because it names no id.
   // `parseGrantRequest` resolves every name inside the caller's own agents, so
   // the route cannot reach another tenant's agent to begin with.
+  // `docs/API.md` says 201. It stays 201 for a card this call raised, but a
+  // pending card for the same access may already exist (a live deny shares the
+  // dedupe key), and 201 for something that was found rather than created would
+  // be a lie the badge then contradicts. **Zeon:** the contract line wants the
+  // 200 case, plus the 404/422 this route can answer.
   app.post("/api/grants/parse", async (request, reply) => {
     const { text } = parseGrantBody.parse(request.body);
-    const approval = await service.parseGrantRequest(text, callerOf(request));
-    return reply.code(201).send({ approval });
+    const { approval, created } = await service.parseGrantRequest(text, callerOf(request));
+    return reply.code(created ? 201 : 200).send({ approval });
   });
 
   app.post("/api/grants/:id/revoke", async (request) => {

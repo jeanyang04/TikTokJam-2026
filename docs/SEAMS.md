@@ -174,11 +174,14 @@ and giving it one would put data access in the routing layer. The service method
 `getRunEvents`, `getAgentEvents`) are thin calls into `grants.ts` / `approvals.ts`, which
 stay Zeon's. Nothing is memoised — revoke-mid-run depends on reading the store per call.
 
-**`POST /api/grants/parse` will hit the `:id` trap.** It matches the `/api/grants/` prefix,
-finds no `id` param, and throws 500 before the handler runs. Whoever builds the NL stretch
-route: give the ownership gate an exemption, or mount the route somewhere that does not
-match a guarded prefix. `POST /api/grants` and `GET /api/approvals` are fine — no trailing
-slash, so no match — and they check the owner inside `createGrant` / `listApprovals`.
+**`POST /api/grants/parse` hit the `:id` trap, and ticket 08 resolved it with an
+exemption.** It matches the `/api/grants/` prefix, names no `id`, and the gate's answer to
+that is a 500. `idlessRoutes` in `app.ts` is now the one set that turns that throw off, and
+it matches the **registered route string exactly**, never by prefix, so a later
+`/api/grants/parse/:id` stays guarded. **Anything added to that set must check the caller's
+ownership itself.** `POST /api/grants` and `GET /api/approvals` never needed it: no
+trailing slash, so no match, and they check the owner inside `createGrant` /
+`listApprovals`.
 
 **`fromAgent` is required and nullable, not optional** (`null` = the owner's own CRM, which
 has no source agent). Sending `{}` is a 400, not a CRM grant.
@@ -321,3 +324,81 @@ its own process only, so `npm run seed` from a second shell writes the *defaults
 or run it before `npm run poc`. The command prints both resolved paths for exactly this
 reason. Auto-seeding on boot is deliberately not wired: it would reset the demo state in
 the middle of a rehearsal.
+
+---
+
+## Natural-language grants (`nl-grant.ts`, B1's file)
+
+**Landed (B1, ticket 08):** `POST /api/grants/parse {text}` → `201 {approval}` with
+`source:"nl_intent"`, per `docs/API.md`. The stretch item, and the first thing on
+CLAUDE.md's cut list.
+
+**The card is the gateway's card with a different badge.** `kind:"grant"` and the same
+`grant` payload `gateway.ts` builds on a no-grant deny, so `decideApproval` writes the
+PolicyGrant without knowing which raised it. A test approves an nl_intent card with
+`allow_always` and asserts the grant lands, so a change to the payload shape fails there
+rather than on stage.
+
+**`resource` and `action` are byte-identical to `gateway.ts`'s `grantCard` on purpose.**
+`createCardOnDeny` dedupes on `(agentId, kind, resource, action)`, so a second format for
+the same access would put two cards in front of the operator for one decision. The
+consequence: after a Scene 1 live deny, a parse request for the same grant **returns that
+pending card unchanged**, badge and all. Right behaviour, one pending decision per access,
+but the route then answers **`200`, not the `201` `docs/API.md` pins**, because nothing was
+created. **Zeon:** the contract line wants that 200, and the `404` / `422` this route can
+also answer.
+
+**`allow_run` is refused on an nl_intent card, with a 409.** `runId` and `jti` are `null`
+because no run asked, and `approvals.ts`'s grant branch resolves the run window through
+`card.jti` with **no fallback when it is null** (its scope branch has one, which is what
+makes this easy to misread). So `allow_run` would write `expiresAt: null`: a permanent
+grant from the narrower button. `AgentService.decideApproval` fails closed instead.
+**Zeon:** a `?? tenMinutesFromNow` in that branch retires the guard, and it is the only
+reason these cards cannot take all three buttons. Gateway cards, which always carry a
+`jti`, are untouched by the guard.
+
+**Names resolve inside the caller's own agents, and this route can reach no others.** Agent
+names are not unique between tenants, so a store-wide lookup would mis-hit (Alex may also
+have a "Writer") and would answer whether another tenant owns a given name. Filtering to
+the caller first removes both. **The consequence is a deliberate deviation from CLAUDE.md
+rule 3:** an unknown name is `404` and writes no RunEvent, and there is no cross-tenant
+`403` on this route at all, because nothing cross-tenant is visible to refuse. Rule 3
+governs reaching an existing resource by id; here no id is ever supplied. **F:** do not
+render a 404 from this route as "no such agent anywhere". It means "you have no agent by
+that name".
+
+**`gateway.ts:125` answers the same input class differently, and that is not an oversight
+to reconcile away.** There a name that resolves to another tenant's agent is a `403` plus
+an audit row. The actor differs: the gateway is an *agent* reaching for a target, which is
+an attempt worth seeing in the timeline, while this route is a *human* naming agents in
+their own namespace. **Zeon:** if you want them uniform, the gateway's behaviour is the one
+to keep, and this route would need an audited 403 that also reintroduces the
+name-existence oracle. Worth a decision, not a silent drift.
+
+**Workspace grants only, and exactly one action.** `crm_read` / `crm_write` are gated on
+scope alone and never call `findLiveGrant`, so a PolicyGrant on `crm` is a row nothing
+reads: an approval that looks like it worked and changes nothing. The parser therefore
+refuses to produce one, and refuses two actions at once, so the card's `action` stays the
+single token every other card and timeline row uses. **Zeon:** if CRM ever becomes
+grant-gated, this is where the NL path opens back up.
+
+**The model's answer is untrusted input.** Ark is asked first when `isArkConfigured`, and
+whatever comes back is validated against the same zod schema the grammar output is, before
+any name is resolved. Every Ark failure mode (unreachable, timeout, non-200, malformed
+JSON, a schema the model ignored) returns `null` so the grammar still gets a go, and the
+call carries a 10s `AbortSignal.timeout`.
+
+**The Ark request shape is not verified against a live endpoint.** It posts to
+`${arkBaseUrl}/responses` because that is what `llm-proxy.ts` forwards to and what
+`writeCodexConfig` sets `wire_api` to, rather than introducing a second convention. If Ark
+rejects it, the demo still works off the grammar and nobody notices in the room. **B2:**
+you own the Ark wire format; this is the second caller.
+
+**Nothing in the suite reaches the network.** `parseGrantIntent` takes the fetch as an
+argument, and `AgentService` takes the parser as an optional constructor argument, so route
+tests run with Ark unconfigured. `makeHarness(prefix, env)` gained an env override for
+exactly that.
+
+**The caller's prose never reaches a RunEvent.** The card creation logs `kind:"approval"`,
+`decision:"pending"`, `reason:"nl_intent"` and the text's *length*. The text is human prose
+that may contain anything, including an injection aimed at whoever reads the trail.

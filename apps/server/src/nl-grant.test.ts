@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { createCardOnDeny } from "./approvals.js";
 import { loadConfig } from "./config.js";
 import {
   parseGrantIntent,
@@ -42,17 +43,21 @@ describe("the demo grammar", () => {
     });
   });
 
-  it("reads the CRM form as the owner's own records", () => {
-    expect(parseWithGrammar("let Researcher read the CRM")).toEqual({
-      toAgent: "Researcher",
-      fromAgent: null,
-      resource: "crm",
-      actions: ["read"],
-    });
-  });
-
   it("returns null rather than guessing at a sentence it does not know", () => {
     expect(parseWithGrammar("give Researcher whatever it needs")).toBeNull();
+  });
+
+  it("does not offer a CRM grant, which the gateway would never read", async () => {
+    // `crm_read`/`crm_write` are gated on scope alone, so a PolicyGrant on
+    // `crm` is a row nothing consults.
+    expect(parseWithGrammar("let Researcher read the CRM")).toBeNull();
+    expect(await parseGrantIntent(noArkConfig, "let Researcher read the CRM")).toBeNull();
+  });
+
+  it("reads as unparseable rather than throwing when a name is absurdly long", async () => {
+    const text = "let " + "R".repeat(80) + " read Writer's notes";
+    expect(parseWithGrammar(text)).not.toBeNull();
+    await expect(parseGrantIntent(noArkConfig, text)).resolves.toBeNull();
   });
 });
 
@@ -78,6 +83,22 @@ describe("the Ark path", () => {
       arkConfig,
       "anything",
       arkAnswering(JSON.stringify({ toAgent: "Researcher", resource: "everything" })),
+    );
+    expect(intent).toBeNull();
+  });
+
+  it("refuses an answer asking for two actions at once", async () => {
+    const intent = await parseWithArk(
+      arkConfig,
+      "let Researcher do everything to Writer's notes",
+      arkAnswering(
+        JSON.stringify({
+          toAgent: "Researcher",
+          fromAgent: "Writer",
+          resource: "workspace",
+          actions: ["read", "write"],
+        }),
+      ),
     );
     expect(intent).toBeNull();
   });
@@ -172,6 +193,69 @@ describe("POST /api/grants/parse", () => {
       actions: ["read"],
       revokedAt: null,
     });
+  });
+
+  it("refuses Allow for this run, which would write a permanent grant", async () => {
+    const harness = await harnessWithoutArk();
+    await seedTwoAgents(harness);
+    const created = await harness.app.inject({
+      method: "POST",
+      url: "/api/grants/parse",
+      headers: await harness.as("user-jean"),
+      payload: { text: "let Researcher read Writer's notes" },
+    });
+
+    // `decideApproval` reads the run window off `card.jti`, and there is no run
+    // behind an nl_intent card. Without this guard the narrower button writes
+    // the broader grant.
+    const decided = await harness.app.inject({
+      method: "POST",
+      url: "/api/approvals/" + created.json().approval.id + "/decide",
+      headers: await harness.as("user-jean"),
+      payload: { decision: "allow_run" },
+    });
+
+    expect(decided.statusCode).toBe(409);
+    expect(harness.store.snapshot().policyGrants).toEqual([]);
+  });
+
+  it("returns the pending card a live deny already raised, and does not claim 201", async () => {
+    const harness = await harnessWithoutArk();
+    const { researcher, writer } = await seedTwoAgents(harness);
+    // Exactly what gateway.ts writes on a no-grant deny.
+    const live = await createCardOnDeny(harness.store, {
+      source: "live_deny",
+      kind: "grant",
+      agentId: researcher.id,
+      ownerId: "user-jean",
+      runId: "run-1",
+      jti: "jti-1",
+      resource: "Writer/workspace",
+      action: "read",
+      scope: null,
+      grant: {
+        fromOwner: "user-jean",
+        fromAgent: writer.id,
+        toAgent: researcher.id,
+        resource: "workspace",
+        actions: ["read"],
+        egress: ["internal"],
+      },
+      reason: "no grant",
+    });
+
+    const response = await harness.app.inject({
+      method: "POST",
+      url: "/api/grants/parse",
+      headers: await harness.as("user-jean"),
+      payload: { text: "let Researcher read Writer's notes" },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json().approval.id).toBe(live.id);
+    // One pending decision per access: the operator must not see two cards for
+    // the same grant because it was asked for twice.
+    expect(harness.store.snapshot().approvals).toHaveLength(1);
   });
 
   it("cannot name another tenant's agent, so it 404s before any card exists", async () => {

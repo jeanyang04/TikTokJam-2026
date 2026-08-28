@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { isArkConfigured, type AppConfig } from "./config.js";
-import type { GrantAction, Resource } from "./types.js";
+import type { GrantAction } from "./types.js";
 
 /**
  * Plain English to a grant *intent*. Names, not ids: nobody types a uuid, and
@@ -11,21 +11,28 @@ import type { GrantAction, Resource } from "./types.js";
  * Ark is asked first when it is configured, and the regex grammar is the
  * fallback. Either way the result goes through `intentSchema` before anything
  * downstream sees it: the model's output is untrusted input like any other.
+ *
+ * **Workspace grants only, and exactly one action.** `crm_read` / `crm_write`
+ * in `gateway.ts` are gated on scope alone and never consult `findLiveGrant`,
+ * so a PolicyGrant on `crm` would be a row nothing reads: a card that looks
+ * like it worked and changes nothing. One action because the card's `action`
+ * feeds the dedupe key and the operator's own reading of what they are
+ * approving; "read+write" is a string no other card produces.
  */
 export interface GrantIntent {
   /** Recipient, as written. */
   toAgent: string;
-  /** Source agent as written, or null for the caller's own CRM. */
-  fromAgent: string | null;
-  resource: Resource;
-  actions: GrantAction[];
+  /** Agent whose workspace is shared, as written. */
+  fromAgent: string;
+  resource: "workspace";
+  actions: [GrantAction];
 }
 
 const intentSchema = z.object({
   toAgent: z.string().trim().min(1).max(64),
-  fromAgent: z.string().trim().min(1).max(64).nullable(),
-  resource: z.enum(["workspace", "crm"]),
-  actions: z.array(z.enum(["read", "write"])).min(1).max(2),
+  fromAgent: z.string().trim().min(1).max(64),
+  resource: z.literal("workspace"),
+  actions: z.tuple([z.enum(["read", "write"])]),
 });
 
 /** Ark gets this, and its answer is still validated against `intentSchema`. */
@@ -35,49 +42,36 @@ const INTENT_JSON_SCHEMA = {
   required: ["toAgent", "fromAgent", "resource", "actions"],
   properties: {
     toAgent: { type: "string", description: "Agent receiving access, as named by the user" },
-    fromAgent: {
-      type: ["string", "null"],
-      description: "Agent whose data is shared, or null when the user means their own CRM",
-    },
-    resource: { type: "string", enum: ["workspace", "crm"] },
+    fromAgent: { type: "string", description: "Agent whose workspace is being shared" },
+    resource: { type: "string", enum: ["workspace"] },
     actions: {
       type: "array",
       items: { type: "string", enum: ["read", "write"] },
       minItems: 1,
+      maxItems: 1,
     },
   },
 } as const;
 
 const SYSTEM_PROMPT = [
-  "Extract one access grant from the user's sentence.",
-  "toAgent receives access; fromAgent owns the data being shared.",
-  "Use resource 'crm' with fromAgent null when the user means their own customer records.",
-  "Anything a file or set of notes lives in is resource 'workspace'.",
+  "Extract one workspace access grant from the user's sentence.",
+  "toAgent receives access; fromAgent owns the workspace being shared.",
+  "Choose exactly one action, the weaker one if the sentence is ambiguous.",
   "Never invent an agent the sentence does not name.",
 ].join(" ");
 
-/** `let Researcher read Writer's notes` and the CRM form. The demo grammar. */
+/** `let Researcher read Writer's notes`. The demo grammar. */
 const WORKSPACE_GRAMMAR =
   /\blet\s+([\w.-]+)\s+(read|write)\s+([\w.-]+)(?:'s|’s)?\s+(?:notes?|workspace|files?)/i;
-const CRM_GRAMMAR = /\blet\s+([\w.-]+)\s+(read|write)\s+(?:the\s+|my\s+)?crm\b/i;
 
 export function parseWithGrammar(text: string): GrantIntent | null {
-  const crm = CRM_GRAMMAR.exec(text);
-  if (crm) {
-    return {
-      toAgent: crm[1]!,
-      fromAgent: null,
-      resource: "crm",
-      actions: [crm[2]!.toLowerCase() as GrantAction],
-    };
-  }
-  const workspace = WORKSPACE_GRAMMAR.exec(text);
-  if (!workspace) return null;
+  const match = WORKSPACE_GRAMMAR.exec(text);
+  if (!match) return null;
   return {
-    toAgent: workspace[1]!,
-    fromAgent: workspace[3]!,
+    toAgent: match[1]!,
+    fromAgent: match[3]!,
     resource: "workspace",
-    actions: [workspace[2]!.toLowerCase() as GrantAction],
+    actions: [match[2]!.toLowerCase() as GrantAction],
   };
 }
 
@@ -150,5 +144,10 @@ export async function parseGrantIntent(
     if (fromArk) return fromArk;
   }
   const fromGrammar = parseWithGrammar(text);
-  return fromGrammar ? intentSchema.parse(fromGrammar) : null;
+  if (!fromGrammar) return null;
+  // safeParse, not parse: the grammar's `[\w.-]+` is unbounded and the schema
+  // caps a name at 64, so a long one must read as "could not parse" (422)
+  // rather than escaping as a ZodError the route turns into a 400.
+  const checked = intentSchema.safeParse(fromGrammar);
+  return checked.success ? checked.data : null;
 }
