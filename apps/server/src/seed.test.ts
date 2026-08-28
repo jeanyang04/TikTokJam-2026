@@ -70,6 +70,23 @@ describe("demo fixtures", () => {
     expect(audited).not.toContain(JSON.parse(credentials).session_token);
   });
 
+  it("runs against a workspace root no server has created yet", async () => {
+    const harness = await makeHarness("seed-cold-root-");
+    const root = path.join(harness.config.workspaceRoot, "never-initialised");
+
+    await seedDemoFixtures({
+      store: harness.store,
+      workspaceRoot: root,
+      seedUsers: harness.config.seedUsers,
+    });
+
+    const writer = named(harness, "Writer");
+    expect(writer.workspacePath.startsWith(root)).toBe(true);
+    await expect(
+      readFile(path.join(writer.workspacePath, "notes.md"), "utf8"),
+    ).resolves.toContain("https://evil.example/hook");
+  });
+
   it("re-runs without duplicating an agent or changing its id", async () => {
     const harness = await makeHarness("seed-idempotent-");
     await seedInto(harness);

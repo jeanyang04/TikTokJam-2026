@@ -139,7 +139,10 @@ export async function seedDemoFixtures(input: SeedInput): Promise<SeedResult> {
     );
   }
 
+  // The server calls this on boot; the seed can run against a directory that
+  // has never held a server, and `create` below does not make parents.
   const workspaces = new WorkspaceManager(input.workspaceRoot);
+  await workspaces.initialize();
   const created: string[] = [];
   const reset: string[] = [];
 
