@@ -47,7 +47,11 @@ export async function cleanupHarnesses(): Promise<void> {
   );
 }
 
-export async function makeHarness(prefix = "launchpad-test-"): Promise<Harness> {
+export async function makeHarness(
+  prefix = "launchpad-test-",
+  /** Env overrides, for a test that needs Ark unconfigured (or configured). */
+  env: NodeJS.ProcessEnv = {},
+): Promise<Harness> {
   const root = await mkdtemp(path.join(tmpdir(), prefix));
   temporaryDirectories.push(root);
   const config = loadConfig({
@@ -57,6 +61,7 @@ export async function makeHarness(prefix = "launchpad-test-"): Promise<Harness> 
     CODEX_HOME: path.join(root, "codex"),
     ARK_API_KEY: "test-key",
     ARK_MODEL: "ep-test",
+    ...env,
   });
   const store = new JsonStore(path.join(root, "data", "db.json"));
   const service = new AgentService(

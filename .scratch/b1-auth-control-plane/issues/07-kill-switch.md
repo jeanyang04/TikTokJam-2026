@@ -4,7 +4,7 @@
 
 **Blocked by:** 04 (RunToken mint).
 
-**Status:** ready-for-agent
+**Status:** done (commits `2cf8ea2`, `859e27e`). See `docs/SEAMS.md` § The Kill switch.
 
 - [ ] `POST /api/agents/:id/kill` revokes every RunToken row for the agent (`revokedAt` set)
 - [ ] Clears `Agent.permissions.tools`
