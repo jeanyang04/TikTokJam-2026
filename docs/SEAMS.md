@@ -278,6 +278,14 @@ the *next* one. A reset that only half applies is worse than one that refuses. W
 directly rather than through `AgentService` is what makes this the only guard in the way,
 and it keeps the reset in one `store.mutate`.
 
+**A reseed undoes the Kill switch on a cast agent, deliberately.** `killAgent` empties
+`permissions.tools` and `tempScopes`; the reset writes the baseline back, so an operator
+who kills Researcher during a rehearsal gets a scoped Researcher for the next one. That is
+what a rehearsal reset is for, and it is the opposite of what the Kill switch section above
+argues about resurrection, which is about the *agent's own* path back. **Zeon:** if the
+durable dead-marker you floated there lands, this is the code that has to decide whether to
+clear it. Refusing to reseed a tombstoned agent is the safer default.
+
 **The seeded scopes are load-bearing, so read `FIXTURE_AGENTS` before changing them.**
 Researcher gets `workspace:read` so Scene 1's deny is the missing *grant* (a card
 `allow_always` can answer) rather than a missing scope, and `webhook:send` so Scene 2's

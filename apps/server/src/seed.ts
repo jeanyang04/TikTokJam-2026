@@ -241,11 +241,20 @@ async function main(): Promise<void> {
   const config = loadConfig();
   const store = new JsonStore(path.join(config.dataDirectory, "launchpad.json"));
   await store.initialize();
-  const result = await seedDemoFixtures({
-    store,
-    workspaceRoot: config.workspaceRoot,
-    seedUsers: config.seedUsers,
-  });
+  // The busy guard and the unknown-owner refusal both carry a message written
+  // for whoever ran this. A raw stack would bury it.
+  let result: SeedResult;
+  try {
+    result = await seedDemoFixtures({
+      store,
+      workspaceRoot: config.workspaceRoot,
+      seedUsers: config.seedUsers,
+    });
+  } catch (error) {
+    process.stderr.write((error as Error).message + "\n");
+    process.exitCode = 2;
+    return;
+  }
   // `npm run poc` points APP_DATA_DIR and AGENT_WORKSPACE_ROOT at a state root
   // it exports only into its own process, so a bare `npm run seed` in a second
   // shell writes the defaults instead. Printing both paths is what tells the
