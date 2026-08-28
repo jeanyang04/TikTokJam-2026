@@ -9,6 +9,7 @@
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
+    "seed": "tsx src/seed.ts",
     "start": "node dist/index.js"
   },
   "dependencies": {

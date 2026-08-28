@@ -246,3 +246,51 @@ exactly when it is needed. The container is left running; Stop is what kills the
 **An already-revoked token keeps its first timestamp.** When an identity died is evidence,
 and a second kill must not rewrite the first one. `closeRunToken` at run end has the same
 rule, from the other side.
+
+---
+
+## The demo cast (`seed.ts`, B1's file)
+
+**Landed (B1, ticket 05):** `npm run seed` → `seedDemoFixtures()`. Researcher and Writer
+(Jean), Alex-1 (Alex), Writer's workspace holding `notes.md` with the planted instruction
+and a fake `credentials.json`.
+
+**It lives at `apps/server/src/seed.ts`, and `docs/TEAM.md` says `scripts/seed.ts`.** A
+file at the repo root is outside every tsconfig: `npm run typecheck` and `npm run build`
+would both skip it and vitest would not collect `seed.test.ts` next to it, so the one gate
+CLAUDE.md rule 1 names could not see the code. The npm script keeps TEAM.md's entry point.
+
+**Re-running is a rehearsal reset, not just a no-op.** Ids survive (grants, RunTokens and
+RunEvents all reference them), and `permissions.tools`, `tempScopes` and any live grant
+touching the cast go back to the baseline — otherwise run-through two starts with Scene 1's
+"Always allow" already answered and the first scene has nothing to deny. Agents outside the
+cast, and the whole audit trail, are untouched: the store is never truncated.
+
+**The seeded scopes are load-bearing, so read `FIXTURE_AGENTS` before changing them.**
+Researcher gets `workspace:read` so Scene 1's deny is the missing *grant* (a card
+`allow_always` can answer) rather than a missing scope, and `webhook:send` so Scene 2's
+exfil attempt reaches the IFC check instead of stopping one step earlier. No grant is
+seeded — Scene 1 is what creates it, and Scene 2 consumes it.
+
+**It writes rows directly, not through `AgentService`.** One `store.mutate`, so a seed
+during a live run cannot trip the busy→409 guard, and no RunEvents: this is the operator
+setting the stage, not an action inside a run. `WorkspaceManager.create` uses
+`recursive: false` and would throw on the second run, so the directory is made here and
+only `AGENTS.md` and the fixture files are rewritten.
+
+**`credentials.json`'s fake token is shaped like a JWT (`eyJ…`) on purpose.** B3's
+`redact.ts` scrubs that pattern, so the Scene 2 audit row shows `[redacted]` rather than
+the payload. **B3:** if the pattern list changes, this fixture is what proves it still
+bites on the demo path.
+
+**Users are not seeded, because there is nowhere to seed them.** `Database` has no users
+table; they come from `SEED_USERS` and are parsed at login. The seed instead *refuses* an
+owner that `SEED_USERS` does not contain, before writing anything — an agent stamped with
+an owner nobody can log in as is invisible to every session.
+
+**`npm run poc` does not seed.** It exports `APP_DATA_DIR` / `AGENT_WORKSPACE_ROOT` into
+its own process only, so `npm run seed` from a second shell writes the *defaults*
+(`.data`, `workspaces`) instead of the running server's state. Pass the same two variables,
+or run it before `npm run poc`. The command prints both resolved paths for exactly this
+reason. Auto-seeding on boot is deliberately not wired: it would reset the demo state in
+the middle of a rehearsal.
