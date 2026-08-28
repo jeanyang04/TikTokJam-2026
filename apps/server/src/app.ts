@@ -57,6 +57,9 @@ const grantBody = z.object({
 const decideBody = z.object({
   decision: z.enum(["allow_run", "allow_always", "deny"]),
 });
+// Bounded because it is forwarded to a model: a long body is a prompt-injection
+// surface and a cost, not a richer request.
+const parseGrantBody = z.object({ text: z.string().trim().min(1).max(500) });
 // `limit` belongs to the agent timeline only: a run's events are bounded by the
 // run (`docs/API.md` §Events).
 const eventsQuery = z.object({ filter: z.enum(["policy", "all"]).default("policy") });
@@ -130,8 +133,20 @@ export async function createApp(
     },
   ];
 
+  /**
+   * Routes that sit under a guarded prefix but address no id. This set is the
+   * only place where "no `:id`" stops meaning "throw", so **anything added here
+   * must check the caller's ownership itself**. Matched on the registered route
+   * string exactly, never by prefix, so a later `/api/grants/parse/:id` would
+   * still be guarded.
+   */
+  const idlessRoutes = new Set(["/api/grants/parse"]);
+
   app.addHook("preHandler", async (request) => {
     const route = request.routeOptions.url ?? "";
+    if (idlessRoutes.has(route)) {
+      return;
+    }
     const matched = ownershipChecks.find((entry) => route.startsWith(entry.prefix));
     if (!matched) {
       return;
@@ -246,6 +261,15 @@ export async function createApp(
     const body = grantBody.parse(request.body);
     const grant = await service.createGrant(body, callerOf(request));
     return reply.code(201).send({ grant });
+  });
+
+  // Exempt from the ownership gate (`idlessRoutes`) because it names no id.
+  // `parseGrantRequest` resolves every name inside the caller's own agents, so
+  // the route cannot reach another tenant's agent to begin with.
+  app.post("/api/grants/parse", async (request, reply) => {
+    const { text } = parseGrantBody.parse(request.body);
+    const approval = await service.parseGrantRequest(text, callerOf(request));
+    return reply.code(201).send({ approval });
   });
 
   app.post("/api/grants/:id/revoke", async (request) => {

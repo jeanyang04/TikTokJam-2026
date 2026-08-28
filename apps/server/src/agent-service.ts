@@ -4,7 +4,8 @@ import { signAgent } from "./auth.js";
 import type { AppConfig } from "./config.js";
 import { isArkConfigured } from "./config.js";
 import { HttpError, RunCancelledError } from "./errors.js";
-import { decideApproval, listApprovals } from "./approvals.js";
+import { createCardOnDeny, decideApproval, listApprovals } from "./approvals.js";
+import { parseGrantIntent, type GrantIntent } from "./nl-grant.js";
 import { createGrant, listGrants, revokeGrant, type GrantInput } from "./grants.js";
 import { DEFAULT_PERMISSIONS, effectiveScopes, JsonStore } from "./store.js";
 import type {
@@ -49,6 +50,15 @@ export class AgentService {
     private readonly store: JsonStore,
     private readonly workspaces: WorkspaceManager,
     private readonly runner: AgentRunner,
+    /**
+     * Injected so a test can decide what the sentence meant without a network
+     * call. The default asks Ark when it is configured and falls back to the
+     * grammar; nothing in the suite reaches Ark.
+     */
+    private readonly intentParser: (
+      config: AppConfig,
+      text: string,
+    ) => Promise<GrantIntent | null> = parseGrantIntent,
   ) {}
 
   async initialize(): Promise<void> {
@@ -415,6 +425,74 @@ export class AgentService {
 
   listApprovals(ownerId: string): ApprovalRequest[] {
     return listApprovals(this.store, ownerId);
+  }
+
+  /**
+   * `POST /api/grants/parse`: plain English in, a pending card out. The card is
+   * the same `kind:"grant"` shape the gateway raises on a no-grant deny, so
+   * `decideApproval` writes the PolicyGrant without knowing which one it is.
+   * Only `source` differs.
+   *
+   * **Names resolve inside the caller's own agents, never across the store.**
+   * Names are not unique between tenants, so a global lookup would both mis-hit
+   * (Alex may also have a "Writer") and answer whether another tenant has an
+   * agent by that name. Filtering first means this route cannot see anyone
+   * else's agents, so an unknown name is a plain 404 and there is no
+   * cross-tenant 403 to reach. That is a deliberate difference from the
+   * id-addressed routes, where a 403 plus an audit row is the right answer.
+   */
+  async parseGrantRequest(text: string, callerId: string): Promise<ApprovalRequest> {
+    const intent = await this.intentParser(this.config, text);
+    if (!intent) {
+      throw new HttpError(422, "Could not read a grant out of that");
+    }
+    const mine = this.store.snapshot().agents.filter((agent) => agent.ownerId === callerId);
+    const byName = (written: string): Agent => {
+      const match = mine.find(
+        (agent) => agent.name.toLowerCase() === written.trim().toLowerCase(),
+      );
+      if (!match) throw new HttpError(404, "You have no agent named " + written);
+      return match;
+    };
+
+    const to = byName(intent.toAgent);
+    const from = intent.fromAgent === null ? null : byName(intent.fromAgent);
+    const card = await createCardOnDeny(this.store, {
+      source: "nl_intent",
+      kind: "grant",
+      agentId: to.id,
+      ownerId: callerId,
+      // No run raised this: the human asked for it directly, so there is no
+      // token to widen for and `allow_run` falls back to its own window.
+      runId: null,
+      jti: null,
+      resource: (from?.name ?? callerId) + "/" + intent.resource,
+      action: intent.actions.join("+"),
+      scope: null,
+      grant: {
+        fromOwner: callerId,
+        fromAgent: from?.id ?? null,
+        toAgent: to.id,
+        resource: intent.resource,
+        actions: intent.actions,
+        egress: ["internal"],
+      },
+      reason: "requested in natural language",
+    });
+    await recordEvent(this.store, {
+      runId: null,
+      agentId: to.id,
+      ownerId: callerId,
+      kind: "approval",
+      action: card.action,
+      resource: card.resource,
+      decision: "pending",
+      // The text is the human's own prose and may contain anything, so its
+      // length is all that goes in the trail (CLAUDE.md rule 4).
+      reason: "nl_intent",
+      detail: { cardId: card.id, source: card.source, textLength: text.length },
+    });
+    return card;
   }
 
   async decideApproval(
