@@ -490,3 +490,53 @@ was checked directly against the compiled `dist/audit.js` + `dist/redact.js` the
 server actually uses, not inferred from the unit tests alone. If the pattern list ever
 needs to diverge between the two, that divergence is invisible to `npm run test` and would
 need its own test wired through `setRedactor()` to catch.
+
+---
+
+## IFC fingerprint persistence (`ifc.ts`, Zeon's file — B3 extended it, not replaced it)
+
+**Landed (B3):** `index` (the in-memory shingle-hash `Map` Zeon left as a deliberate
+placeholder, comment: *"B3 may replace with a persistent one"*) is still there and still
+what every request-path lookup reads — `matchOrigin()` stayed synchronous on purpose, since
+it runs mid tool-call inside `egressGate()` and can't await a store round-trip. What
+changed is that `fingerprint()` now writes through to the store (hashes + label, never the
+raw content) on every call, and a new `loadFingerprints(store)` rehydrates the cache from
+those rows once at startup — `index.ts` calls it right after `service.initialize()`, before
+the gateway is registered. Net effect: a server restart mid-demo no longer silently drops
+Scene 2's provenance data, without adding a single `await` to `gateway.ts`'s tool handlers.
+
+**The one call site that had to change:** `fingerprint(ctx.run, label, text)` in
+`gateway.ts` became `fingerprint(store, ctx.run, label, text)` — `store` was already in
+scope in that closure, so this is the only line touched in a file B3 doesn't own.
+`matchOrigin()` and `checkEgress()` kept their exact signatures; nothing else in
+`gateway.ts` needed to change.
+
+**`Database` gained a `fingerprints: FingerprintEntry[]` field** (`types.ts` — Zeon's
+shared contract, extended the same cautious way B1's `ownerId`/`permissions` additions
+were: additive, with a default in `store.ts`'s `emptyDatabase()` so a v1 or v2 file with no
+`fingerprints` key loads exactly as before). **Only ever hashes + a `Label`, never the
+content that produced them** — the whole point of a "fingerprint" here is that the index
+itself can't become a second copy of whatever secret it's tracking. `store.test.ts`'s
+pinned v2-migration fixture needed the same one-line addition to keep matching the new
+shape; that test's assertions are otherwise untouched.
+
+**Persistence is fire-and-forget, not awaited.** `store.mutate()` queues and persists
+atomically on its own (see `store.ts`), so `fingerprint()`/`clearFingerprints()` call it
+without `await` and swallow a failed write. A lost write degrades to "this one read has no
+persisted provenance if the server restarts right now" — never to a blocked tool call, and
+never to the hot cache disagreeing with what's on disk in the meantime, since the cache is
+always updated synchronously first, before the store write is even queued.
+
+**`clearFingerprints(store, runId)` still has no caller anywhere in the codebase** — that
+predates this change (it was already unused when `index` was in-memory-only) and is still
+true now. The in-memory cache and the persisted rows both grow unbounded across a long
+session; not fixed here, since wiring a call site (most likely on run completion, in
+`agent-service.ts`) is B1's file to touch. Flagging it rather than adding an uninvited call
+site.
+
+**New test file, `ifc.test.ts`** (not gated — no Postgres/Docker involved, pure `JsonStore`
++ `ifc.ts`): proves persisted rows contain hashes and a label but never the original text,
+and — the one existing `gateway.test.ts` Scene 2 test can't show — that `matchOrigin()`
+genuinely fails after the in-memory cache is cleared and genuinely recovers once
+`loadFingerprints()` reloads it from the store, i.e. that this actually survives a restart
+rather than merely compiling.

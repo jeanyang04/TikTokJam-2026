@@ -11,6 +11,7 @@ const emptyDatabase = (): Database => ({
   policyGrants: [],
   approvals: [],
   runEvents: [],
+  fingerprints: [],
 });
 
 /** Scopes a new RunToken should carry: permanent tools ∪ unexpired temp scopes. B1 calls this when minting. */

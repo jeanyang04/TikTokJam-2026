@@ -8,6 +8,7 @@ import { llmProxyPlugin } from "./llm-proxy.js";
 import { createApp } from "./app.js";
 import { loadConfig, writeCodexConfig } from "./config.js";
 import { demoPlugin } from "./demo.js";
+import { loadFingerprints } from "./ifc.js";
 import { redact } from "./redact.js";
 import { createRunner } from "./runner-factory.js";
 import { JsonStore } from "./store.js";
@@ -28,6 +29,11 @@ const runner = createRunner(config);
 const service = new AgentService(config, store, workspaces, runner);
 const webhookSink = new MockWebhookSink();
 await service.initialize();
+
+// B3: rehydrates ifc.ts's in-memory fingerprint cache from the store, so a
+// restart mid-demo doesn't lose Scene 2's provenance data. Must run before
+// the gateway (registered below) accepts its first request.
+loadFingerprints(store);
 
 const app = await createApp(config, service);
 

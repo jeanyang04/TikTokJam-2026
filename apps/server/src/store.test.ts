@@ -159,6 +159,7 @@ describe("v1 → v2 migration", () => {
       policyGrants: [],
       approvals: [],
       runEvents: [],
+      fingerprints: [],
     };
     const store = await storeWith(v2Database);
     await store.initialize();
