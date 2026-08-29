@@ -22,8 +22,13 @@ const temporaryDirectories: string[] = [];
 
 afterEach(async () => {
   await Promise.all(
+    // Best-effort, for the reason `cleanupHarnesses` spells out: this file
+    // asserts mid-run, so the store is still writing when the test ends and a
+    // plain recursive delete races it to ENOTEMPTY.
     temporaryDirectories.splice(0).map((directory) =>
-      rm(directory, { recursive: true, force: true }),
+      rm(directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 }).catch(
+        () => undefined,
+      ),
     ),
   );
 });

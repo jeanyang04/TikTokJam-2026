@@ -9,6 +9,8 @@ import type {
   PolicyGrant,
   RunEvent,
   SystemInfo,
+  WorkspaceFile,
+  WorkspaceFileContent,
 } from "./types";
 
 type AgentInput = {
@@ -117,6 +119,14 @@ export const api = {
     request<{ agent: Agent }>("/api/agents/" + id + "/kill", {
       method: "POST",
     }),
+  listWorkspaceFiles: (id: string) =>
+    request<{ files: WorkspaceFile[]; truncated: boolean }>(
+      "/api/agents/" + id + "/files",
+    ),
+  readWorkspaceFile: (id: string, filePath: string) =>
+    request<{ file: WorkspaceFileContent }>(
+      "/api/agents/" + id + "/files/content?path=" + encodeURIComponent(filePath),
+    ),
   getAgentGrants: (id: string) =>
     request<{ grants: PolicyGrant[] }>("/api/agents/" + id + "/grants"),
   revokeGrant: (id: string) =>

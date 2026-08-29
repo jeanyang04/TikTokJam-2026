@@ -127,6 +127,21 @@ export interface AgentRun {
   createdAt: string;
 }
 
+export interface WorkspaceFile {
+  /** Relative to the workspace root, always "/"-separated. */
+  path: string;
+  size: number;
+  modifiedAt: string;
+}
+
+export interface WorkspaceFileContent {
+  path: string;
+  content: string;
+  size: number;
+  truncated: boolean;
+  binary: boolean;
+}
+
 export interface SystemInfo {
   arkConfigured: boolean;
   arkBaseUrl: string;
