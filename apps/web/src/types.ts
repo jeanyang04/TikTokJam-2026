@@ -1,11 +1,76 @@
 export type AgentStatus = "ready" | "busy" | "stopped" | "error";
 export type RunStatus = "queued" | "running" | "completed" | "failed" | "cancelled";
+export type Scope =
+  | "workspace:read"
+  | "workspace:write"
+  | "crm:read"
+  | "crm:write"
+  | "webhook:send";
+
+export interface AgentPermissions {
+  sandbox: "read-only" | "workspace-write";
+  network: boolean;
+  webSearch: boolean;
+  tools: Scope[];
+}
+
+export interface TempScope {
+  scope: Scope;
+  expiresAt: string;
+}
+
+export type Egress = "internal" | "agent" | "external";
+export type GrantAction = "read" | "write";
+export type Resource = "workspace" | "crm";
+
+export interface PolicyGrant {
+  id: string;
+  fromOwner: string;
+  fromAgent: string | null;
+  toAgent: string;
+  resource: Resource;
+  actions: GrantAction[];
+  egress: Egress[];
+  createdAt: string;
+  expiresAt: string | null;
+  revokedAt: string | null;
+}
+
+export type ApprovalSource = "live_deny" | "nl_intent";
+export type ApprovalKind = "scope" | "grant" | "declassify";
+export type ApprovalDecision = "allow_run" | "allow_always" | "deny";
+export type ApprovalStatus = "pending" | ApprovalDecision;
+
+export interface ApprovalRequest {
+  id: string;
+  source: ApprovalSource;
+  kind: ApprovalKind;
+  agentId: string;
+  ownerId: string;
+  runId: string | null;
+  jti: string | null;
+  resource: string;
+  action: string;
+  scope: Scope | null;
+  grant: Pick<
+    PolicyGrant,
+    "fromOwner" | "fromAgent" | "toAgent" | "resource" | "actions" | "egress"
+  > | null;
+  reason: string;
+  status: ApprovalStatus;
+  createdAt: string;
+  decidedAt: string | null;
+  decidedBy: string | null;
+}
 
 export interface Agent {
   id: string;
   name: string;
   description: string;
   instructions: string;
+  ownerId: string;
+  permissions: AgentPermissions;
+  tempScopes: TempScope[];
   status: AgentStatus;
   workspacePath: string;
   codexThreadId: string | null;

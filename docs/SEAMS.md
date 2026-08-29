@@ -408,3 +408,21 @@ exactly that.
 **The caller's prose never reaches a RunEvent.** The card creation logs `kind:"approval"`,
 `decision:"pending"`, `reason:"nl_intent"` and the text's *length*. The text is human prose
 that may contain anything, including an injection aimed at whoever reads the trail.
+
+---
+
+## Codex runtime version (`Dockerfile.runtime`, B2's file)
+
+**Compatibility pin (verified 2026-08-29):** the runtime uses Codex `0.100.0`, deliberately
+not PLAN/TEAM's `0.144.6`. Codex `0.130.0` and `0.144.6` discover Launchpad successfully
+(`initialize` and `tools/list` both return 200) but serialize the MCP server into the Ark
+Responses request as `{type:"namespace", name:"mcp__launchpad..."}`. Ark rejects the whole
+request with `InvalidParameter: unknown tool type: namespace`, so the model never sees
+`workspace_read` and no gateway/card event can occur.
+
+`0.100.0` was tested through a host-side diagnostic model proxy that logged tool names and
+types only: it emitted `{type:"function", name:"mcp__launchpad__workspace_read"}`, Ark
+accepted the request, and Codex completed `tools/call`. It also sends the configured
+`http_headers` Agent JWT and honors `enabled_tools`. Do not bump Codex without an actual Ark
+round-trip that proves those three behaviours; argument snapshots alone cannot detect this
+provider incompatibility.

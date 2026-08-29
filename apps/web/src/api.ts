@@ -1,4 +1,20 @@
-import type { Agent, AgentRun, Message, SystemInfo } from "./types";
+import type {
+  Agent,
+  AgentPermissions,
+  AgentRun,
+  ApprovalDecision,
+  ApprovalRequest,
+  Message,
+  PolicyGrant,
+  SystemInfo,
+} from "./types";
+
+type AgentInput = {
+  name: string;
+  description: string;
+  instructions: string;
+  permissions: AgentPermissions;
+};
 
 export class ApiError extends Error {
   constructor(
@@ -10,15 +26,34 @@ export class ApiError extends Error {
 }
 
 let authToken = "";
+let unauthorizedHandler: (() => void) | null = null;
 
 export function setAuthToken(token: string): void {
   authToken = token.trim();
 }
 
+export function clearAuthToken(): void {
+  authToken = "";
+}
+
+export function setUnauthorizedHandler(handler: (() => void) | null): void {
+  unauthorizedHandler = handler;
+}
+
+function isProtectedApiRequest(url: string): boolean {
+  const path = url.split("?", 1)[0];
+  return path.startsWith("/api/") && ![
+    "/api/auth",
+    "/api/auth/login",
+    "/api/health",
+  ].includes(path);
+}
+
 async function request<T>(url: string, options?: RequestInit): Promise<T> {
+  const tokenAtRequest = authToken;
   const headers = {
     ...(options?.body ? { "Content-Type": "application/json" } : {}),
-    ...(authToken ? { Authorization: "Bearer " + authToken } : {}),
+    ...(tokenAtRequest ? { Authorization: "Bearer " + tokenAtRequest } : {}),
     ...options?.headers,
   };
   const response = await fetch(url, {
@@ -27,6 +62,16 @@ async function request<T>(url: string, options?: RequestInit): Promise<T> {
   });
   const data = (await response.json().catch(() => ({}))) as T & { error?: string };
   if (!response.ok) {
+    if (
+      response.status === 401 &&
+      tokenAtRequest &&
+      authToken === tokenAtRequest &&
+      isProtectedApiRequest(url)
+    ) {
+      clearAuthToken();
+      unauthorizedHandler?.();
+      throw new ApiError("Your session expired. Please sign in again.", 401);
+    }
     throw new ApiError(data.error ?? "Request failed", response.status);
   }
   return data;
@@ -34,20 +79,21 @@ async function request<T>(url: string, options?: RequestInit): Promise<T> {
 
 export const api = {
   auth: () => request<{ required: boolean }>("/api/auth"),
+  login: (userId: string) =>
+    request<{ token: string; user: { id: string; name: string } }>("/api/auth/login", {
+      method: "POST",
+      body: JSON.stringify({ userId }),
+    }),
   system: () => request<SystemInfo>("/api/system"),
   listAgents: () => request<{ agents: Agent[] }>("/api/agents"),
-  createAgent: (body: {
-    name: string;
-    description: string;
-    instructions: string;
-  }) =>
+  createAgent: (body: AgentInput) =>
     request<{ agent: Agent }>("/api/agents", {
       method: "POST",
       body: JSON.stringify(body),
     }),
   updateAgent: (
     id: string,
-    body: { name: string; description: string; instructions: string },
+    body: AgentInput,
   ) =>
     request<{ agent: Agent }>("/api/agents/" + id, {
       method: "PATCH",
@@ -64,6 +110,22 @@ export const api = {
   stopAgent: (id: string) =>
     request<{ agent: Agent }>("/api/agents/" + id + "/stop", {
       method: "POST",
+    }),
+  killAgent: (id: string) =>
+    request<{ agent: Agent }>("/api/agents/" + id + "/kill", {
+      method: "POST",
+    }),
+  getAgentGrants: (id: string) =>
+    request<{ grants: PolicyGrant[] }>("/api/agents/" + id + "/grants"),
+  revokeGrant: (id: string) =>
+    request<{ grant: PolicyGrant }>("/api/grants/" + id + "/revoke", {
+      method: "POST",
+    }),
+  listApprovals: () => request<{ approvals: ApprovalRequest[] }>("/api/approvals"),
+  decideApproval: (id: string, decision: ApprovalDecision) =>
+    request<{ approval: ApprovalRequest }>("/api/approvals/" + id + "/decide", {
+      method: "POST",
+      body: JSON.stringify({ decision }),
     }),
   messages: (id: string) =>
     request<{ messages: Message[] }>("/api/agents/" + id + "/messages"),
