@@ -195,7 +195,7 @@ export const gatewayPlugin: FastifyPluginAsync<GatewayDeps> = async (app, deps) 
         if (grant) {
           const label = labelFor(grant.id, target, grant.egress);
           await addTaint(store, ctx.jti, label);
-          fingerprint(ctx.run, label, text);
+          fingerprint(store, ctx.run, label, text);
         }
         return text;
       });
