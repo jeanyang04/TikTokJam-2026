@@ -426,3 +426,135 @@ accepted the request, and Codex completed `tools/call`. It also sends the config
 `http_headers` Agent JWT and honors `enabled_tools`. Do not bump Codex without an actual Ark
 round-trip that proves those three behaviours; argument snapshots alone cannot detect this
 provider incompatibility.
+
+---
+
+## Postgres / LOCK 2 (`docker-compose.yml`, `migrations/001_init.sql`, `db.ts`, B3's files)
+
+**Landed (B3):** the `postgres` service, `001_init.sql`, and `db.ts`'s `withOwner`, plugged
+into the `withOwner` slot `gateway.ts`/`index.ts` already had waiting (see the gateway
+section above). `crm_read`/`crm_write` are real now, not just "unavailable".
+
+**Host port is 5433, not Postgres's usual 5432.** A dev machine may already have a local
+Postgres bound to 5432 (this repo's own reference machine did) — 5433 avoids fighting it
+for the port. The container's *internal* port is still 5432; only the host-side mapping
+moved. `DATABASE_URL_ADMIN`/`DATABASE_URL_AGENT` in `.env.example` and
+`start-local-poc.sh`'s defaults both already say 5433 — if you're constructing either
+string yourself instead of reading the exported env var, don't hardcode 5432.
+
+**`crm_records` has a `UNIQUE (owner_id, customer)` constraint that `docs/PLAN.md`'s
+schema sketch didn't call out.** `gateway.ts`'s `crm_write` does `INSERT ... ON CONFLICT
+(owner_id, customer) DO UPDATE` — found by reading that code before writing the migration,
+not by the schema sketch, which has no such constraint. Without it the upsert throws
+"no unique or exclusion constraint matching ON CONFLICT specification" the first time
+anyone actually calls `crm_write`. If `crm_records` ever needs a schema change, keep this
+constraint or `crm_write` breaks again the same way.
+
+**`SET LOCAL app.owner_id = $1` is a Postgres syntax error — `SET` never takes bind
+parameters, only literals.** `withOwner()` uses `SELECT set_config('app.owner_id', $1,
+true)` instead: the parameterized equivalent, `true` meaning transaction-scoped exactly
+like `LOCAL`. This is not a style choice. The tempting "fix" — building the `SET LOCAL`
+statement by splicing the owner id into the SQL text — would reopen the SQL-injection hole
+`withOwner` exists to close, in the one function every crm_* call trusts for tenant
+isolation. Pinned in `rls.test.ts` and `db.ts`'s own comment; don't rewrite this call as a
+plain `SET LOCAL` no matter how the error message reads.
+
+**`app_admin` (`BYPASSRLS`) is not used anywhere in the gateway path.** It exists for admin
+tooling and tests that legitimately need to see across owners. `withOwner()` — the only
+thing `crm_*` tools call — always runs as `app_agent` (`NOBYPASSRLS`), so RLS is load-
+bearing on every gateway call, not just nominally present.
+
+**Two independent tests exist for this, at different layers, and they answer different
+questions.** `rls.test.ts` proves the Postgres policy holds on its own — raw SQL, no
+gateway, no app code, gated on `DATABASE_URL_AGENT`. `crm-gateway.test.ts` proves LOCK 1
+(gateway scope/grant checks) and LOCK 2 (RLS) hold *together*, the way a real Codex tool
+call exercises them: two owners, both passing every gateway-side check identically, one
+still can't see the other's row. If you're extending `crm_read`/`crm_write`, the second
+file is the one to add a case to; the first is about the policy, not the tool.
+
+**`start-local-poc.sh`'s Postgres-readiness check polls the container's Docker healthcheck
+via `docker inspect`, not `docker compose exec ... pg_isready`.** The `exec` form was tried
+first and was unreliable in this specific non-interactive script context — it looped
+through all 30 retries and never reported ready, even though the same `pg_isready` command
+run directly in a shell succeeded instantly. Root cause not fully chased down (likely a
+`docker compose exec` + non-tty/scripted-invocation interaction); `docker inspect -f
+'{{.State.Health.Status}}'` against the container id from `docker compose ps -q postgres`
+sidesteps it entirely and is what's in the script now. If you're touching that wait loop,
+don't switch it back to the `exec` form without confirming it actually reports ready in a
+plain `npm run poc` run, not just when typed by hand — the two behaved differently here.
+
+---
+
+## Redaction (`redact.ts`, B3's file, wired via `audit.ts`'s `setRedactor()`)
+
+**Landed (B3):** `setRedactor(redact)`, called once in `index.ts` at startup, replaces the
+placeholder pattern list that was living directly in `audit.ts` (see the gateway section
+above — Zeon left it there on purpose, commented as B3's to replace).
+
+**Redact BEFORE truncating, not after — the placeholder had this backwards.** The old
+order truncated a string at 2KB first, then ran the redaction patterns over what was left.
+A secret straddling the 2048-char cut would get sliced mid-token by the truncation, and a
+half-token no longer matches the pattern meant to catch it — the fragment ships to the
+trail unredacted. `redact.ts` runs the patterns first and truncates whatever's left, so
+truncation only ever trims content that's already been swept. Pinned in `redact.test.ts`.
+
+**`setRedactor()` is only called from `index.ts`, which tests never import.** Test files go
+through `test-harness.ts`/`makeHarness()`, not the real entrypoint, so `audit.ts`'s
+placeholder pattern list is still what's active during `npm run test` — including
+`seed.test.ts`'s pinned check that the fake-JWT `credentials.json` fixture gets redacted.
+That's fine and deliberate: the placeholder list already covers the same four patterns, so
+nothing in the suite is testing stale behavior, and confirmed by hand — the real `redact.ts`
+was checked directly against the compiled `dist/audit.js` + `dist/redact.js` the running
+server actually uses, not inferred from the unit tests alone. If the pattern list ever
+needs to diverge between the two, that divergence is invisible to `npm run test` and would
+need its own test wired through `setRedactor()` to catch.
+
+---
+
+## IFC fingerprint persistence (`ifc.ts`, Zeon's file — B3 extended it, not replaced it)
+
+**Landed (B3):** `index` (the in-memory shingle-hash `Map` Zeon left as a deliberate
+placeholder, comment: *"B3 may replace with a persistent one"*) is still there and still
+what every request-path lookup reads — `matchOrigin()` stayed synchronous on purpose, since
+it runs mid tool-call inside `egressGate()` and can't await a store round-trip. What
+changed is that `fingerprint()` now writes through to the store (hashes + label, never the
+raw content) on every call, and a new `loadFingerprints(store)` rehydrates the cache from
+those rows once at startup — `index.ts` calls it right after `service.initialize()`, before
+the gateway is registered. Net effect: a server restart mid-demo no longer silently drops
+Scene 2's provenance data, without adding a single `await` to `gateway.ts`'s tool handlers.
+
+**The one call site that had to change:** `fingerprint(ctx.run, label, text)` in
+`gateway.ts` became `fingerprint(store, ctx.run, label, text)` — `store` was already in
+scope in that closure, so this is the only line touched in a file B3 doesn't own.
+`matchOrigin()` and `checkEgress()` kept their exact signatures; nothing else in
+`gateway.ts` needed to change.
+
+**`Database` gained a `fingerprints: FingerprintEntry[]` field** (`types.ts` — Zeon's
+shared contract, extended the same cautious way B1's `ownerId`/`permissions` additions
+were: additive, with a default in `store.ts`'s `emptyDatabase()` so a v1 or v2 file with no
+`fingerprints` key loads exactly as before). **Only ever hashes + a `Label`, never the
+content that produced them** — the whole point of a "fingerprint" here is that the index
+itself can't become a second copy of whatever secret it's tracking. `store.test.ts`'s
+pinned v2-migration fixture needed the same one-line addition to keep matching the new
+shape; that test's assertions are otherwise untouched.
+
+**Persistence is fire-and-forget, not awaited.** `store.mutate()` queues and persists
+atomically on its own (see `store.ts`), so `fingerprint()`/`clearFingerprints()` call it
+without `await` and swallow a failed write. A lost write degrades to "this one read has no
+persisted provenance if the server restarts right now" — never to a blocked tool call, and
+never to the hot cache disagreeing with what's on disk in the meantime, since the cache is
+always updated synchronously first, before the store write is even queued.
+
+**`clearFingerprints(store, runId)` still has no caller anywhere in the codebase** — that
+predates this change (it was already unused when `index` was in-memory-only) and is still
+true now. The in-memory cache and the persisted rows both grow unbounded across a long
+session; not fixed here, since wiring a call site (most likely on run completion, in
+`agent-service.ts`) is B1's file to touch. Flagging it rather than adding an uninvited call
+site.
+
+**New test file, `ifc.test.ts`** (not gated — no Postgres/Docker involved, pure `JsonStore`
++ `ifc.ts`): proves persisted rows contain hashes and a label but never the original text,
+and — the one existing `gateway.test.ts` Scene 2 test can't show — that `matchOrigin()`
+genuinely fails after the in-memory cache is cleared and genuinely recovers once
+`loadFingerprints()` reloads it from the store, i.e. that this actually survives a restart
+rather than merely compiling.

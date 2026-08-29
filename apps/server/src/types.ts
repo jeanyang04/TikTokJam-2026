@@ -37,6 +37,19 @@ export interface Label {
   egress: Egress[];
 }
 
+/**
+ * IFC provenance record (Level B — names *which* grant-scoped read a piece
+ * of outbound content came from, on top of the Level A allow/deny that
+ * `taints`/`egress` already do). Shingle hashes + the label only — never
+ * the raw content — so ifc.ts's persisted index can never itself become a
+ * copy of whatever it's fingerprinting.
+ */
+export interface FingerprintEntry {
+  runId: string;
+  label: Label;
+  hashes: string[];
+}
+
 /** Store row keyed by jti. AUTHORITATIVE — enforcement reads this, not JWT claims. */
 export interface RunToken {
   jti: string;
@@ -172,6 +185,7 @@ export interface Database {
   policyGrants: PolicyGrant[];
   approvals: ApprovalRequest[];
   runEvents: RunEvent[];
+  fingerprints: FingerprintEntry[];
 }
 
 export interface CreateAgentInput {
