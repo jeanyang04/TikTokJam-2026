@@ -1,6 +1,24 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { api, ApiError, setAuthToken } from "./api";
-import type { Agent, AgentRun, Message, SystemInfo } from "./types";
+import {
+  api,
+  ApiError,
+  clearAuthToken,
+  setAuthToken,
+  setUnauthorizedHandler,
+} from "./api";
+import type {
+  Agent,
+  AgentPermissions,
+  AgentRun,
+  ApprovalDecision,
+  ApprovalRequest,
+  EventFilter,
+  Message,
+  PolicyGrant,
+  RunEvent,
+  Scope,
+  SystemInfo,
+} from "./types";
 
 const starterPrompts = [
   "Create a small TypeScript CLI that prints a weather summary from sample JSON.",
@@ -8,18 +26,112 @@ const starterPrompts = [
   "Build a responsive single-page todo app with tests.",
 ];
 
-const emptyForm = {
+const defaultPermissions: AgentPermissions = {
+  sandbox: "workspace-write",
+  network: true,
+  webSearch: false,
+  tools: [],
+};
+
+const newAgentForm = () => ({
   name: "",
   description: "",
   instructions:
     "Help me build and test software in this workspace. Keep changes small and explain the result.",
-};
+  permissions: { ...defaultPermissions, tools: [...defaultPermissions.tools] },
+});
+
+const toolOptions: ReadonlyArray<{
+  scope: Scope;
+  label: string;
+  description: string;
+}> = [
+    { scope: "workspace:read", label: "Read workspaces", description: "Read files through the audited gateway." },
+    { scope: "workspace:write", label: "Write workspaces", description: "Write files through the audited gateway." },
+    { scope: "crm:read", label: "Read CRM", description: "Read CRM records for this tenant." },
+    { scope: "crm:write", label: "Write CRM", description: "Create or update tenant CRM notes." },
+    { scope: "webhook:send", label: "Send webhooks", description: "Request external egress through the gateway." },
+  ];
+
+const demoUsers = [
+  { id: "user-jean", name: "Jean" },
+  { id: "user-alex", name: "Alex" },
+];
+
+const authStorageKey = "launchpad.auth";
+
+type LoggedInUser = { id: string; name: string };
+
+function restoreStoredUser(): LoggedInUser | null {
+  const raw = window.localStorage.getItem(authStorageKey);
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw) as { token?: unknown; user?: unknown };
+    const user = parsed.user as Partial<LoggedInUser> | undefined;
+    if (
+      typeof parsed.token !== "string" ||
+      !parsed.token.trim() ||
+      typeof user?.id !== "string" ||
+      !user.id ||
+      typeof user.name !== "string" ||
+      !user.name
+    ) {
+      throw new Error("Invalid stored session");
+    }
+    setAuthToken(parsed.token);
+    return { id: user.id, name: user.name };
+  } catch {
+    window.localStorage.removeItem(authStorageKey);
+    clearAuthToken();
+    return null;
+  }
+}
 
 function formatTime(value: string): string {
   return new Intl.DateTimeFormat(undefined, {
     hour: "2-digit",
     minute: "2-digit",
   }).format(new Date(value));
+}
+
+function formatDateTime(value: string): string {
+  return new Intl.DateTimeFormat(undefined, {
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(new Date(value));
+}
+
+function formatEventTime(value: string): string {
+  return new Intl.DateTimeFormat(undefined, {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  }).format(new Date(value));
+}
+
+function shortId(value: string): string {
+  return value.length > 12 ? value.slice(0, 8) + "…" : value;
+}
+
+function formatEventLabel(value: string): string {
+  return value.replaceAll("_", " ");
+}
+
+function formatDetailValue(value: unknown): string {
+  if (typeof value === "string") return value;
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}
+
+function grantState(grant: PolicyGrant): "active" | "expired" | "revoked" {
+  if (grant.revokedAt) return "revoked";
+  if (grant.expiresAt && grant.expiresAt <= new Date().toISOString()) return "expired";
+  return "active";
 }
 
 function StatusPill({ status }: { status: Agent["status"] }) {
@@ -35,6 +147,167 @@ function Spinner() {
   return <span className="spinner" aria-label="Loading" />;
 }
 
+function PermissionChips({
+  permissions,
+  compact = false,
+}: {
+  permissions: AgentPermissions;
+  compact?: boolean;
+}) {
+  const chips = [
+    {
+      label: permissions.sandbox === "read-only" ? "Read-only" : "Workspace write",
+      kind: "runtime",
+      muted: false,
+    },
+    ...(!compact || permissions.network
+      ? [{ label: permissions.network ? "Network on" : "Network off", kind: "runtime", muted: !permissions.network }]
+      : []),
+    ...(!compact || permissions.webSearch
+      ? [{ label: permissions.webSearch ? "Web search on" : "Web search off", kind: "runtime", muted: !permissions.webSearch }]
+      : []),
+    ...permissions.tools.map((scope) => ({ label: scope, kind: "tool", muted: false })),
+    ...(!compact && permissions.tools.length === 0
+      ? [{ label: "No gateway tools", kind: "tool", muted: true }]
+      : []),
+  ];
+  const visible = compact ? chips.slice(0, 3) : chips;
+  const remaining = chips.length - visible.length;
+
+  return (
+    <div className={"permission-chips" + (compact ? " permission-chips-compact" : "")}>
+      {visible.map((chip) => (
+        <span
+          className={
+            "permission-chip permission-chip-" + chip.kind + (chip.muted ? " muted" : "")
+          }
+          key={chip.label}
+        >
+          {chip.label}
+        </span>
+      ))}
+      {remaining > 0 && <span className="permission-chip permission-chip-more">+{remaining}</span>}
+    </div>
+  );
+}
+
+function PermissionsFields({
+  idPrefix,
+  permissions,
+  onChange,
+}: {
+  idPrefix: string;
+  permissions: AgentPermissions;
+  onChange: (permissions: AgentPermissions) => void;
+}) {
+  const setTool = (scope: Scope, enabled: boolean) => {
+    const tools = enabled
+      ? [...new Set([...permissions.tools, scope])]
+      : permissions.tools.filter((item) => item !== scope);
+    onChange({ ...permissions, tools });
+  };
+
+  return (
+    <fieldset className="permissions-editor">
+      <legend>Permissions</legend>
+      <p className="permissions-help">
+        Sandbox access controls direct Codex access to its own workspace. Workspace tools
+        are gateway-mediated and audited.
+      </p>
+
+      <div className="permission-group">
+        <span className="permission-group-title">Sandbox</span>
+        <div className="permission-choice-grid">
+          <label className="permission-choice" htmlFor={idPrefix + "-sandbox-read"}>
+            <input
+              id={idPrefix + "-sandbox-read"}
+              name={idPrefix + "-sandbox"}
+              type="radio"
+              checked={permissions.sandbox === "read-only"}
+              onChange={() => onChange({ ...permissions, sandbox: "read-only" })}
+            />
+            <span>
+              <strong>Read-only</strong>
+              <small>Codex cannot directly modify its runtime workspace.</small>
+            </span>
+          </label>
+          <label className="permission-choice" htmlFor={idPrefix + "-sandbox-write"}>
+            <input
+              id={idPrefix + "-sandbox-write"}
+              name={idPrefix + "-sandbox"}
+              type="radio"
+              checked={permissions.sandbox === "workspace-write"}
+              onChange={() => onChange({ ...permissions, sandbox: "workspace-write" })}
+            />
+            <span>
+              <strong>Workspace write</strong>
+              <small>Codex may directly edit files in its own workspace.</small>
+            </span>
+          </label>
+        </div>
+      </div>
+
+      <div className="permission-group">
+        <span className="permission-group-title">Runtime capabilities</span>
+        <div className="permission-choice-grid">
+          <label className="permission-choice" htmlFor={idPrefix + "-network"}>
+            <input
+              id={idPrefix + "-network"}
+              type="checkbox"
+              checked={permissions.network}
+              onChange={(event) =>
+                onChange({ ...permissions, network: event.target.checked })
+              }
+            />
+            <span>
+              <strong>Network access</strong>
+              <small>Allow sandboxed commands to access the network.</small>
+            </span>
+          </label>
+          <label className="permission-choice" htmlFor={idPrefix + "-web-search"}>
+            <input
+              id={idPrefix + "-web-search"}
+              type="checkbox"
+              checked={permissions.webSearch}
+              onChange={(event) =>
+                onChange({ ...permissions, webSearch: event.target.checked })
+              }
+            />
+            <span>
+              <strong>Web search</strong>
+              <small>Enable Codex's built-in live web search.</small>
+            </span>
+          </label>
+        </div>
+      </div>
+
+      <div className="permission-group">
+        <span className="permission-group-title">Gateway tools</span>
+        <div className="permission-tools-grid">
+          {toolOptions.map((tool) => (
+            <label className="permission-choice" htmlFor={idPrefix + "-" + tool.scope} key={tool.scope}>
+              <input
+                id={idPrefix + "-" + tool.scope}
+                type="checkbox"
+                checked={permissions.tools.includes(tool.scope)}
+                onChange={(event) => setTool(tool.scope, event.target.checked)}
+              />
+              <span>
+                <strong>{tool.label}</strong>
+                <code>{tool.scope}</code>
+                <small>{tool.description}</small>
+              </span>
+            </label>
+          ))}
+        </div>
+        <p className="permissions-note">
+          A tool scope permits a request. Accessing another agent's data still requires a live grant.
+        </p>
+      </div>
+    </fieldset>
+  );
+}
+
 export default function App() {
   const [agents, setAgents] = useState<Agent[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -42,26 +315,103 @@ export default function App() {
   const [system, setSystem] = useState<SystemInfo | null>(null);
   const [showCreate, setShowCreate] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
-  const [form, setForm] = useState(emptyForm);
+  const [form, setForm] = useState(newAgentForm);
   const [prompt, setPrompt] = useState("");
   const [activeRun, setActiveRun] = useState<AgentRun | null>(null);
+  const [approvals, setApprovals] = useState<ApprovalRequest[]>([]);
+  const [approvalsLoading, setApprovalsLoading] = useState(false);
+  const [decidingApprovalId, setDecidingApprovalId] = useState<string | null>(null);
+  const [grants, setGrants] = useState<PolicyGrant[]>([]);
+  const [grantsLoading, setGrantsLoading] = useState(false);
+  const [revokingGrantId, setRevokingGrantId] = useState<string | null>(null);
+  const [events, setEvents] = useState<RunEvent[]>([]);
+  const [eventsLoading, setEventsLoading] = useState(false);
+  const [eventFilter, setEventFilter] = useState<EventFilter>("policy");
+  const [killingAgent, setKillingAgent] = useState(false);
+  const [securityNotice, setSecurityNotice] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [authRequired, setAuthRequired] = useState<boolean | null>(null);
-  const [authInput, setAuthInput] = useState("");
+  const [currentUser, setCurrentUser] = useState<LoggedInUser | null>(restoreStoredUser);
   const messageEnd = useRef<HTMLDivElement>(null);
   const selectedIdRef = useRef<string | null>(null);
   const mountedRef = useRef(true);
   const pollingRunIds = useRef(new Set<string>());
+  const sessionVersionRef = useRef(0);
+  const eventRequestRef = useRef(0);
+  const timelineFilterRef = useRef<EventFilter>(eventFilter);
+  const initialUserRef = useRef(currentUser);
   selectedIdRef.current = selectedId;
+  timelineFilterRef.current = eventFilter;
 
   const selected = useMemo(
     () => agents.find((agent) => agent.id === selectedId) ?? null,
     [agents, selectedId],
   );
+  const pendingApprovals = useMemo(
+    () => approvals
+      .filter((approval) => approval.status === "pending")
+      .sort((left, right) => right.createdAt.localeCompare(left.createdAt)),
+    [approvals],
+  );
+  const latestBlockedEvent = useMemo(() => {
+    if (!activeRun) return null;
+    const policyEvents = events.filter(
+      (event) =>
+        event.runId === activeRun.id &&
+        ["gateway", "approval", "grant"].includes(event.kind),
+    );
+    const latest = policyEvents.at(-1) ?? null;
+    return latest?.decision === "deny" ? latest : null;
+  }, [activeRun, events]);
+  const blockedEventHasCard = useMemo(
+    () =>
+      latestBlockedEvent !== null &&
+      pendingApprovals.some(
+        (approval) =>
+          approval.agentId === latestBlockedEvent.agentId &&
+          approval.runId === latestBlockedEvent.runId,
+      ),
+    [latestBlockedEvent, pendingApprovals],
+  );
+
+  const clearSession = useCallback((message: string | null = null) => {
+    sessionVersionRef.current += 1;
+    window.localStorage.removeItem(authStorageKey);
+    clearAuthToken();
+    pollingRunIds.current.clear();
+    selectedIdRef.current = null;
+    setCurrentUser(null);
+    setAgents([]);
+    setSelectedId(null);
+    setMessages([]);
+    setSystem(null);
+    setShowCreate(false);
+    setShowSettings(false);
+    setForm(newAgentForm());
+    setPrompt("");
+    setActiveRun(null);
+    setApprovals([]);
+    setApprovalsLoading(false);
+    setDecidingApprovalId(null);
+    setGrants([]);
+    setGrantsLoading(false);
+    setRevokingGrantId(null);
+    eventRequestRef.current += 1;
+    setEvents([]);
+    setEventsLoading(false);
+    setEventFilter("policy");
+    setKillingAgent(false);
+    setSecurityNotice(null);
+    setBusy(false);
+    setError(message);
+    setAuthRequired(true);
+  }, []);
 
   const refreshAgents = useCallback(async () => {
+    const sessionVersion = sessionVersionRef.current;
     const { agents: next } = await api.listAgents();
+    if (!mountedRef.current || sessionVersion !== sessionVersionRef.current) return;
     setAgents(next);
     setSelectedId((current) =>
       current && next.some((agent) => agent.id === current)
@@ -71,38 +421,196 @@ export default function App() {
   }, []);
 
   const refreshMessages = useCallback(async (agentId: string) => {
+    const sessionVersion = sessionVersionRef.current;
     const result = await api.messages(agentId);
-    if (mountedRef.current && selectedIdRef.current === agentId) {
+    if (
+      mountedRef.current &&
+      sessionVersion === sessionVersionRef.current &&
+      selectedIdRef.current === agentId
+    ) {
       setMessages(result.messages);
     }
   }, []);
 
+  const refreshGrants = useCallback(async (agentId: string) => {
+    const sessionVersion = sessionVersionRef.current;
+    setGrantsLoading(true);
+    try {
+      const result = await api.getAgentGrants(agentId);
+      if (
+        mountedRef.current &&
+        sessionVersion === sessionVersionRef.current &&
+        selectedIdRef.current === agentId
+      ) {
+        setGrants(result.grants);
+      }
+    } finally {
+      if (
+        mountedRef.current &&
+        sessionVersion === sessionVersionRef.current &&
+        selectedIdRef.current === agentId
+      ) {
+        setGrantsLoading(false);
+      }
+    }
+  }, []);
+
+  const refreshEvents = useCallback(async (
+    agentId: string,
+    filter: EventFilter,
+    showLoading = false,
+  ) => {
+    const sessionVersion = sessionVersionRef.current;
+    const requestId = ++eventRequestRef.current;
+    if (showLoading) setEventsLoading(true);
+    try {
+      const result = await api.getAgentEvents(agentId, filter);
+      if (
+        mountedRef.current &&
+        sessionVersion === sessionVersionRef.current &&
+        requestId === eventRequestRef.current &&
+        selectedIdRef.current === agentId &&
+        timelineFilterRef.current === filter
+      ) {
+        setEvents(result.events);
+      }
+    } finally {
+      if (
+        mountedRef.current &&
+        sessionVersion === sessionVersionRef.current &&
+        requestId === eventRequestRef.current &&
+        selectedIdRef.current === agentId &&
+        timelineFilterRef.current === filter
+      ) {
+        setEventsLoading(false);
+      }
+    }
+  }, []);
+
+  const refreshApprovals = useCallback(async (showLoading = false) => {
+    const sessionVersion = sessionVersionRef.current;
+    if (showLoading) setApprovalsLoading(true);
+    try {
+      const result = await api.listApprovals();
+      if (mountedRef.current && sessionVersion === sessionVersionRef.current) {
+        setApprovals((current) =>
+          result.approvals.map((incoming) => {
+            const existing = current.find((item) => item.id === incoming.id);
+            return existing?.status !== undefined &&
+              existing.status !== "pending" &&
+              incoming.status === "pending"
+              ? existing
+              : incoming;
+          }),
+        );
+      }
+    } finally {
+      if (
+        showLoading &&
+        mountedRef.current &&
+        sessionVersion === sessionVersionRef.current
+      ) {
+        setApprovalsLoading(false);
+      }
+    }
+  }, []);
+
   const bootstrap = useCallback(async () => {
-    await Promise.all([refreshAgents(), api.system().then(setSystem)]);
+    const sessionVersion = sessionVersionRef.current;
+    const [, nextSystem] = await Promise.all([refreshAgents(), api.system()]);
+    if (mountedRef.current && sessionVersion === sessionVersionRef.current) {
+      setSystem(nextSystem);
+    }
   }, [refreshAgents]);
 
   useEffect(() => {
+    setUnauthorizedHandler(() =>
+      clearSession("Your session expired. Please sign in again."),
+    );
+    return () => setUnauthorizedHandler(null);
+  }, [clearSession]);
+
+  useEffect(() => {
+    let cancelled = false;
     mountedRef.current = true;
     void api
       .auth()
       .then(async ({ required }) => {
-        if (!mountedRef.current) return;
-        setAuthRequired(required);
-        if (!required) await bootstrap();
+        if (cancelled || !mountedRef.current) return;
+        if (!required || initialUserRef.current) {
+          await bootstrap();
+          if (!cancelled && mountedRef.current) setAuthRequired(false);
+        } else {
+          setAuthRequired(true);
+        }
       })
-      .catch((reason) => setError(reason instanceof Error ? reason.message : String(reason)));
+      .catch((reason) => {
+        if (cancelled) return;
+        if (reason instanceof ApiError && reason.status === 401) return;
+        setError(reason instanceof Error ? reason.message : String(reason));
+      });
     return () => {
+      cancelled = true;
       mountedRef.current = false;
     };
   }, [bootstrap]);
 
   useEffect(() => {
+    if (authRequired !== false || !currentUser) return;
+    let cancelled = false;
+    const load = (showLoading: boolean) => {
+      void refreshApprovals(showLoading).catch((reason) => {
+        if (!cancelled && !(reason instanceof ApiError && reason.status === 401)) {
+          setError(reason instanceof Error ? reason.message : String(reason));
+        }
+      });
+    };
+    load(true);
+    const timer = window.setInterval(() => load(false), 2_000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [authRequired, currentUser, refreshApprovals]);
+
+  useEffect(() => {
+    if (authRequired !== false || !currentUser || !selectedId) {
+      eventRequestRef.current += 1;
+      setEvents([]);
+      setEventsLoading(false);
+      return;
+    }
+    let cancelled = false;
+    const load = (showLoading: boolean) => {
+      void refreshEvents(selectedId, eventFilter, showLoading).catch((reason) => {
+        if (!cancelled && !(reason instanceof ApiError && reason.status === 401)) {
+          setError(reason instanceof Error ? reason.message : String(reason));
+        }
+      });
+    };
+    setEvents([]);
+    load(true);
+    const timer = window.setInterval(() => load(false), 2_000);
+    return () => {
+      cancelled = true;
+      eventRequestRef.current += 1;
+      window.clearInterval(timer);
+    };
+  }, [authRequired, currentUser, eventFilter, refreshEvents, selectedId]);
+
+  useEffect(() => {
     setActiveRun(null);
+    setGrants([]);
+    setSecurityNotice(null);
     setShowSettings(false);
     if (!selectedId) {
       setMessages([]);
+      setGrantsLoading(false);
       return;
     }
+    void refreshGrants(selectedId).catch((reason) =>
+      setError(reason instanceof Error ? reason.message : String(reason)),
+    );
     void Promise.all([refreshMessages(selectedId), api.runs(selectedId)])
       .then(([, result]) => {
         if (selectedIdRef.current !== selectedId) return;
@@ -117,7 +625,7 @@ export default function App() {
       .catch((reason) =>
         setError(reason instanceof Error ? reason.message : String(reason)),
       );
-  }, [refreshMessages, selectedId]);
+  }, [refreshGrants, refreshMessages, selectedId]);
 
   useEffect(() => {
     if (selected) {
@@ -125,6 +633,10 @@ export default function App() {
         name: selected.name,
         description: selected.description,
         instructions: selected.instructions,
+        permissions: {
+          ...selected.permissions,
+          tools: [...selected.permissions.tools],
+        },
       });
     }
   }, [selected]);
@@ -142,7 +654,7 @@ export default function App() {
       await refreshAgents();
       setSelectedId(agent.id);
       setShowCreate(false);
-      setForm(emptyForm);
+      setForm(newAgentForm());
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
     } finally {
@@ -201,17 +713,154 @@ export default function App() {
     }
   };
 
+  const decideApproval = async (
+    approval: ApprovalRequest,
+    decision: ApprovalDecision,
+  ) => {
+    if (approval.status !== "pending") return;
+    const sessionVersion = sessionVersionRef.current;
+    const selectedAgentId = selectedIdRef.current;
+    setDecidingApprovalId(approval.id);
+    setSecurityNotice(null);
+    setError(null);
+    try {
+      const { approval: decided } = await api.decideApproval(approval.id, decision);
+      if (mountedRef.current && sessionVersion === sessionVersionRef.current) {
+        setApprovals((current) =>
+          current.map((item) => item.id === decided.id ? decided : item),
+        );
+        setSecurityNotice(
+          decision === "deny"
+            ? "Request denied. No permission or grant was added."
+            : "Approved. Send a follow-up message so the agent retries the action.",
+        );
+        await Promise.all([
+          refreshAgents(),
+          refreshApprovals(),
+          ...(selectedAgentId
+            ? [
+              refreshGrants(selectedAgentId),
+              refreshEvents(selectedAgentId, timelineFilterRef.current),
+            ]
+            : []),
+        ]);
+      }
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      if (mountedRef.current && sessionVersion === sessionVersionRef.current) {
+        setDecidingApprovalId(null);
+      }
+    }
+  };
+
+  const revokeGrant = async (grant: PolicyGrant) => {
+    if (grantState(grant) !== "active") return;
+    if (!window.confirm("Revoke this grant? The next protected call will be denied.")) {
+      return;
+    }
+    const sessionVersion = sessionVersionRef.current;
+    const agentId = selectedIdRef.current;
+    setRevokingGrantId(grant.id);
+    setSecurityNotice(null);
+    setError(null);
+    try {
+      const { grant: revoked } = await api.revokeGrant(grant.id);
+      if (
+        mountedRef.current &&
+        sessionVersion === sessionVersionRef.current &&
+        selectedIdRef.current === agentId
+      ) {
+        setGrants((current) =>
+          current.map((item) => item.id === revoked.id ? revoked : item),
+        );
+        setSecurityNotice("Grant revoked. The next protected call will be checked without it.");
+        await Promise.all([
+          refreshApprovals(),
+          ...(agentId
+            ? [refreshEvents(agentId, timelineFilterRef.current)]
+            : []),
+        ]);
+      }
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      if (mountedRef.current && sessionVersion === sessionVersionRef.current) {
+        setRevokingGrantId(null);
+      }
+    }
+  };
+
+  const killAgentIdentity = async () => {
+    if (!selected) return;
+    if (!window.confirm(
+      "Kill " + selected.name + "'s identity?\n\n" +
+      "This revokes all active run tokens and removes its gateway tool scopes. " +
+      "It does not stop the Codex process or change sandbox access.",
+    )) {
+      return;
+    }
+    const sessionVersion = sessionVersionRef.current;
+    const agentId = selected.id;
+    setKillingAgent(true);
+    setSecurityNotice(null);
+    setError(null);
+    try {
+      const { agent: killed } = await api.killAgent(agentId);
+      if (
+        mountedRef.current &&
+        sessionVersion === sessionVersionRef.current &&
+        selectedIdRef.current === agentId
+      ) {
+        setAgents((current) =>
+          current.map((agent) => agent.id === killed.id ? killed : agent),
+        );
+        setSecurityNotice(
+          killed.name + "'s active identity was revoked and its gateway tools were removed.",
+        );
+        await Promise.all([
+          refreshApprovals(),
+          refreshEvents(agentId, timelineFilterRef.current),
+        ]);
+      }
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      if (mountedRef.current && sessionVersion === sessionVersionRef.current) {
+        setKillingAgent(false);
+      }
+    }
+  };
+
   const pollRun = async (runId: string, agentId: string) => {
     if (pollingRunIds.current.has(runId)) return;
+    const sessionVersion = sessionVersionRef.current;
     pollingRunIds.current.add(runId);
     try {
-      while (mountedRef.current) {
+      while (
+        mountedRef.current &&
+        sessionVersion === sessionVersionRef.current
+      ) {
         await new Promise((resolve) => window.setTimeout(resolve, 900));
-        if (!mountedRef.current) return;
+        if (
+          !mountedRef.current ||
+          sessionVersion !== sessionVersionRef.current
+        ) return;
         const result = await api.run(runId);
-        if (selectedIdRef.current === agentId) setActiveRun(result.run);
+        if (
+          sessionVersion === sessionVersionRef.current &&
+          selectedIdRef.current === agentId
+        ) {
+          setActiveRun(result.run);
+        }
         if (!["queued", "running"].includes(result.run.status)) {
-          await Promise.all([refreshMessages(agentId), refreshAgents()]);
+          await Promise.all([
+            refreshMessages(agentId),
+            refreshAgents(),
+            ...(selectedIdRef.current === agentId
+              ? [refreshEvents(agentId, timelineFilterRef.current)]
+              : []),
+          ]);
           return;
         }
       }
@@ -225,6 +874,7 @@ export default function App() {
     if (!selected || !prompt.trim()) return;
     const content = prompt.trim();
     setPrompt("");
+    setShowSettings(false);
     setError(null);
     try {
       const result = await api.sendMessage(selected.id, content);
@@ -245,25 +895,37 @@ export default function App() {
     }
   };
 
-  const unlock = async (event: React.FormEvent) => {
-    event.preventDefault();
+  const loginAs = async (userId: string) => {
     setBusy(true);
     setError(null);
-    setAuthToken(authInput);
     try {
+      const { token, user } = await api.login(userId);
+      sessionVersionRef.current += 1;
+      pollingRunIds.current.clear();
+      selectedIdRef.current = null;
+      setAuthToken(token);
+      window.localStorage.setItem(authStorageKey, JSON.stringify({ token, user }));
+      setCurrentUser(user);
+      setAgents([]);
+      setSelectedId(null);
+      setMessages([]);
+      setActiveRun(null);
+      setApprovals([]);
+      setGrants([]);
+      eventRequestRef.current += 1;
+      setEvents([]);
+      setEventFilter("policy");
+      setSecurityNotice(null);
       await bootstrap();
-      setAuthRequired(false);
-      setAuthInput("");
+      if (mountedRef.current) setAuthRequired(false);
     } catch (reason) {
-      if (reason instanceof ApiError && reason.status === 401) {
-        setError("The access token is not valid.");
-      } else {
-        setError(reason instanceof Error ? reason.message : String(reason));
-      }
+      setError(reason instanceof Error ? reason.message : String(reason));
     } finally {
-      setBusy(false);
+      if (mountedRef.current) setBusy(false);
     }
   };
+
+  const logout = () => clearSession();
 
   if (authRequired === null) {
     return (
@@ -281,27 +943,25 @@ export default function App() {
   if (authRequired) {
     return (
       <main className="auth-screen">
-        <form className="auth-card" onSubmit={unlock}>
+        <section className="auth-card">
           <div className="brand-mark">A</div>
           <span className="eyebrow">Agent Launchpad</span>
-          <h1>Enter the access token</h1>
-          <p>This shared demo token is configured by the platform operator.</p>
+          <h1>Choose a demo user</h1>
+          <p>We will call /api/auth/login, store the returned token, and show that user's agents.</p>
           {error && <div className="error-banner" role="alert">{error}</div>}
-          <label>
-            Access token
-            <input
-              autoFocus
-              type="password"
-              value={authInput}
-              onChange={(event) => setAuthInput(event.target.value)}
-              autoComplete="current-password"
-              required
-            />
-          </label>
-          <button className="button button-primary" disabled={busy || !authInput.trim()}>
-            {busy ? <Spinner /> : "Open Launchpad"}
-          </button>
-        </form>
+          <div className="auth-actions">
+            {demoUsers.map((user) => (
+              <button
+                key={user.id}
+                className="button button-primary"
+                disabled={busy}
+                onClick={() => void loginAs(user.id)}
+              >
+                {busy ? <Spinner /> : "Continue as " + user.name}
+              </button>
+            ))}
+          </div>
+        </section>
       </main>
     );
   }
@@ -321,10 +981,29 @@ export default function App() {
           </div>
         </div>
 
+        {currentUser && (
+          <div className="account-card">
+            <div className="account-avatar">{currentUser.name.slice(0, 1).toUpperCase()}</div>
+            <div className="account-copy">
+              <strong>{currentUser.name}</strong>
+              <span>
+                {approvalsLoading
+                  ? "Checking requests…"
+                  : pendingApprovals.length > 0
+                    ? pendingApprovals.length + " pending request" + (pendingApprovals.length === 1 ? "" : "s")
+                    : "Signed in"}
+              </span>
+            </div>
+            <button className="account-switch" onClick={logout} title="Switch user">
+              Switch
+            </button>
+          </div>
+        )}
+
         <button
           className="button button-primary create-button"
           onClick={() => {
-            setForm(emptyForm);
+            setForm(newAgentForm());
             setShowCreate(true);
           }}
         >
@@ -345,7 +1024,8 @@ export default function App() {
               <div className="agent-avatar">{agent.name.slice(0, 1).toUpperCase()}</div>
               <div className="agent-card-copy">
                 <strong>{agent.name}</strong>
-                <span>{agent.description || "Coding Agent"}</span>
+                <span className="agent-description">{agent.description || "Coding Agent"}</span>
+                <PermissionChips permissions={agent.permissions} compact />
               </div>
               <span className={"mini-dot mini-" + agent.status} />
             </button>
@@ -401,6 +1081,7 @@ export default function App() {
                   <StatusPill status={selected.status} />
                 </div>
                 <p>{selected.description || "A Codex coding Agent in an isolated workspace."}</p>
+                <PermissionChips permissions={selected.permissions} />
               </div>
               <div className="header-actions">
                 <button
@@ -427,12 +1108,87 @@ export default function App() {
               </div>
             </header>
 
+            {pendingApprovals.length > 0 && (
+              <section className="approvals-panel" aria-label="Pending access requests">
+                <div className="approvals-heading">
+                  <div>
+                    <span className="eyebrow">Human approval required</span>
+                    <h2>Access Requests</h2>
+                    <p>Denied actions stay denied until you decide. Approval applies when the agent retries.</p>
+                  </div>
+                  <span>{pendingApprovals.length} pending</span>
+                </div>
+                <div className="approval-list">
+                  {pendingApprovals.map((approval) => {
+                    const requestingAgent = agents.find(
+                      (agent) => agent.id === approval.agentId,
+                    );
+                    const deciding = decidingApprovalId === approval.id;
+                    return (
+                      <article className="approval-card" key={approval.id}>
+                        <div className="approval-badges">
+                          <span className="approval-source">
+                            {approval.source === "live_deny" ? "Live deny" : "Natural language"}
+                          </span>
+                          <span className={"approval-kind approval-kind-" + approval.kind}>
+                            {approval.kind}
+                          </span>
+                          <time dateTime={approval.createdAt}>{formatDateTime(approval.createdAt)}</time>
+                        </div>
+                        <h3>{requestingAgent?.name ?? shortId(approval.agentId)} requests access</h3>
+                        <div className="approval-request-line">
+                          <strong>{approval.action}</strong>
+                          <span>→</span>
+                          <code>{approval.resource}</code>
+                        </div>
+                        <p className="approval-reason">{approval.reason}</p>
+                        {approval.scope && (
+                          <div className="approval-detail">
+                            Missing scope <code>{approval.scope}</code>
+                          </div>
+                        )}
+                        {approval.grant && (
+                          <div className="approval-detail">
+                            Grant: {approval.grant.resource} · {approval.grant.actions.join(" + ")} · egress {approval.grant.egress.join(", ")}
+                          </div>
+                        )}
+                        {deciding && <div className="approval-saving"><Spinner /> Saving decision…</div>}
+                        <div className="approval-actions">
+                          <button
+                            className="button button-ghost"
+                            disabled={decidingApprovalId !== null}
+                            onClick={() => void decideApproval(approval, "allow_run")}
+                          >
+                            Allow for this run
+                          </button>
+                          <button
+                            className="button button-primary"
+                            disabled={decidingApprovalId !== null}
+                            onClick={() => void decideApproval(approval, "allow_always")}
+                          >
+                            Always allow
+                          </button>
+                          <button
+                            className="button approval-deny-button"
+                            disabled={decidingApprovalId !== null}
+                            onClick={() => void decideApproval(approval, "deny")}
+                          >
+                            Deny
+                          </button>
+                        </div>
+                      </article>
+                    );
+                  })}
+                </div>
+              </section>
+            )}
+
             {showSettings && (
               <form className="settings-panel" onSubmit={saveAgent}>
                 <div className="settings-title">
                   <div>
                     <span className="eyebrow">Agent configuration</span>
-                    <h2>Instructions and identity</h2>
+                    <h2>Identity and permissions</h2>
                   </div>
                   <button type="button" onClick={() => setShowSettings(false)}>×</button>
                 </div>
@@ -468,6 +1224,11 @@ export default function App() {
                     maxLength={10_000}
                   />
                 </label>
+                <PermissionsFields
+                  idPrefix="settings"
+                  permissions={form.permissions}
+                  onChange={(permissions) => setForm({ ...form, permissions })}
+                />
                 <div className="panel-footer">
                   <code>{selected.workspacePath}</code>
                   <button className="button button-primary" disabled={busy}>
@@ -475,6 +1236,128 @@ export default function App() {
                   </button>
                 </div>
               </form>
+            )}
+
+            {securityNotice && (
+              <div className="success-banner" role="status">
+                <span>✓</span>
+                <p>{securityNotice}</p>
+                <button onClick={() => setSecurityNotice(null)} aria-label="Dismiss">×</button>
+              </div>
+            )}
+
+            <section className="security-panel" aria-label="Agent security controls">
+              <div className="security-card grants-card">
+                <div className="security-card-heading">
+                  <div>
+                    <span className="eyebrow">Data relationships</span>
+                    <h2>Policy grants</h2>
+                    <p>Access involving this agent. The gateway checks active grants on every call.</p>
+                  </div>
+                  <span className="security-count">{grants.length}</span>
+                </div>
+
+                {grantsLoading ? (
+                  <div className="security-empty"><Spinner /> Loading grants…</div>
+                ) : grants.length === 0 ? (
+                  <div className="security-empty">
+                    <strong>No grants yet</strong>
+                    <span>Cross-agent access approved by the owner will appear here.</span>
+                  </div>
+                ) : (
+                  <div className="grant-list">
+                    {[...grants]
+                      .sort((left, right) => right.createdAt.localeCompare(left.createdAt))
+                      .map((grant) => {
+                        const state = grantState(grant);
+                        const source = grant.fromAgent === null
+                          ? (currentUser?.name ?? "Owner") + "'s CRM"
+                          : agents.find((agent) => agent.id === grant.fromAgent)?.name ?? shortId(grant.fromAgent);
+                        const destination = agents.find((agent) => agent.id === grant.toAgent)?.name ?? shortId(grant.toAgent);
+                        return (
+                          <article className={"grant-row grant-row-" + state} key={grant.id}>
+                            <div className="grant-main">
+                              <div className="grant-direction">
+                                <strong>{source}</strong>
+                                <span>→</span>
+                                <strong>{destination}</strong>
+                              </div>
+                              <div className="grant-meta">
+                                <span>{grant.resource}</span>
+                                <span>{grant.actions.join(" + ")}</span>
+                                {grant.egress.map((egress) => (
+                                  <span key={egress}>egress: {egress}</span>
+                                ))}
+                              </div>
+                              <div className="grant-lifetime">
+                                {state === "revoked" && grant.revokedAt
+                                  ? "Revoked " + formatDateTime(grant.revokedAt)
+                                  : state === "expired" && grant.expiresAt
+                                    ? "Expired " + formatDateTime(grant.expiresAt)
+                                    : grant.expiresAt
+                                      ? "Temporary · expires " + formatDateTime(grant.expiresAt)
+                                      : "Permanent · active"}
+                              </div>
+                            </div>
+                            {state === "active" ? (
+                              <button
+                                className="button grant-revoke-button"
+                                disabled={revokingGrantId !== null}
+                                onClick={() => void revokeGrant(grant)}
+                              >
+                                {revokingGrantId === grant.id ? <Spinner /> : "Revoke"}
+                              </button>
+                            ) : (
+                              <span className={"grant-state grant-state-" + state}>{state}</span>
+                            )}
+                          </article>
+                        );
+                      })}
+                  </div>
+                )}
+              </div>
+
+              <div className="security-card identity-card">
+                <div className="security-card-heading">
+                  <div>
+                    <span className="eyebrow">Identity controls</span>
+                    <h2>Kill switch</h2>
+                  </div>
+                </div>
+                <p className="identity-copy">
+                  Revoke every active run token and remove all gateway tool scopes for {selected.name}.
+                </p>
+                <div className="identity-scope-count">
+                  <strong>{selected.permissions.tools.length}</strong>
+                  <span>permanent gateway scope{selected.permissions.tools.length === 1 ? "" : "s"}</span>
+                </div>
+                <button
+                  className="button button-danger kill-button"
+                  disabled={killingAgent}
+                  onClick={() => void killAgentIdentity()}
+                >
+                  {killingAgent ? <><Spinner /> Killing identity…</> : "Kill agent identity"}
+                </button>
+                <p className="identity-note">
+                  This does not stop Codex or change sandbox access. Use Stop to end the process.
+                </p>
+              </div>
+            </section>
+
+            {latestBlockedEvent && (
+              <aside className="policy-blocked-callout" role="alert">
+                <div className="policy-blocked-icon">!</div>
+                <div>
+                  <strong>Action blocked by policy</strong>
+                  <p>
+                    {selected.name} could not {formatEventLabel(latestBlockedEvent.action)} → {latestBlockedEvent.resource}.
+                    {latestBlockedEvent.reason ? " Reason: " + latestBlockedEvent.reason + "." : ""}
+                  </p>
+                  {blockedEventHasCard && (
+                    <span>An Access Request Card is pending.</span>
+                  )}
+                </div>
+              </aside>
             )}
 
             <section className="playground">
@@ -582,6 +1465,112 @@ export default function App() {
                 </div>
               </form>
             </section>
+
+            <section className="timeline-panel" aria-label="Agent audit timeline">
+              <div className="timeline-heading">
+                <div>
+                  <span className="eyebrow">Backend evidence</span>
+                  <h2>Audit timeline</h2>
+                  <p>Human → agent → action → resource → outcome. Event details are redacted by the server.</p>
+                </div>
+                <div className="timeline-filters" aria-label="Timeline filter">
+                  <button
+                    className={eventFilter === "policy" ? "selected" : ""}
+                    aria-pressed={eventFilter === "policy"}
+                    onClick={() => setEventFilter("policy")}
+                  >
+                    Policy only
+                  </button>
+                  <button
+                    className={eventFilter === "all" ? "selected" : ""}
+                    aria-pressed={eventFilter === "all"}
+                    onClick={() => setEventFilter("all")}
+                  >
+                    All activity
+                  </button>
+                </div>
+              </div>
+
+              {eventsLoading ? (
+                <div className="timeline-empty"><Spinner /> Loading audit events…</div>
+              ) : events.length === 0 ? (
+                <div className="timeline-empty">
+                  <strong>No {eventFilter === "policy" ? "policy" : "activity"} events yet</strong>
+                  <span>Gateway decisions, approvals, grants, and runtime telemetry will appear here.</span>
+                </div>
+              ) : (
+                <ol className="timeline-list">
+                  {events.map((event) => {
+                    const eventAgent = agents.find((agent) => agent.id === event.agentId);
+                    const owner = event.ownerId === currentUser?.id
+                      ? currentUser.name
+                      : event.ownerId;
+                    const detailEntries = Object.entries(event.detail);
+                    const origin = typeof event.detail.origin === "string"
+                      ? event.detail.origin
+                      : null;
+                    const grantId = typeof event.detail.grantId === "string"
+                      ? event.detail.grantId
+                      : null;
+                    return (
+                      <li
+                        className={
+                          "timeline-row timeline-row-" + (event.decision ?? "neutral")
+                        }
+                        key={event.id}
+                      >
+                        <time dateTime={event.at}>{formatEventTime(event.at)}</time>
+                        <div className="timeline-marker" aria-hidden="true" />
+                        <article>
+                          <div className="timeline-row-heading">
+                            <span className={"timeline-kind timeline-kind-" + event.kind}>
+                              {formatEventLabel(event.kind)}
+                            </span>
+                            <span className={"timeline-outcome timeline-outcome-" + (event.decision ?? "neutral")}>
+                              {event.decision ?? "recorded"}
+                            </span>
+                          </div>
+                          <div className="timeline-actor">
+                            <strong>{owner}</strong>
+                            <span>→</span>
+                            <strong>{eventAgent?.name ?? shortId(event.agentId)}</strong>
+                          </div>
+                          <div className="timeline-action">
+                            <code>{event.action}</code>
+                            <span>→</span>
+                            <code>{event.resource}</code>
+                          </div>
+                          {event.reason && (
+                            <p className="timeline-reason">Reason: {event.reason}</p>
+                          )}
+                          {event.reason === "ifc" && (
+                            <div className="timeline-ifc">
+                              <strong>Blocked external egress</strong>
+                              {origin && <span>Content originated from: {origin}</span>}
+                              {grantId && <span>Grant: {shortId(grantId)}</span>}
+                              <span>Destination: {event.resource}</span>
+                            </div>
+                          )}
+                          {detailEntries.length > 0 && (
+                            <details className="timeline-details">
+                              <summary>Redacted event details</summary>
+                              <dl>
+                                {detailEntries.map(([key, value]) => (
+                                  <div key={key}>
+                                    <dt>{formatEventLabel(key)}</dt>
+                                    <dd>{formatDetailValue(value)}</dd>
+                                  </div>
+                                ))}
+                              </dl>
+                            </details>
+                          )}
+                        </article>
+                      </li>
+                    );
+                  })}
+                </ol>
+              )}
+            </section>
           </>
         ) : (
           <div className="no-agent">
@@ -592,7 +1581,7 @@ export default function App() {
             <button
               className="button button-primary"
               onClick={() => {
-                setForm(emptyForm);
+                setForm(newAgentForm());
                 setShowCreate(true);
               }}
             >
@@ -650,6 +1639,11 @@ export default function App() {
                 maxLength={10_000}
               />
             </label>
+            <PermissionsFields
+              idPrefix="create"
+              permissions={form.permissions}
+              onChange={(permissions) => setForm({ ...form, permissions })}
+            />
             <div className="modal-footer">
               <button
                 type="button"

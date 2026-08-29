@@ -1,4 +1,25 @@
 services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: launchpad
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: launchpad
+    ports:
+      # Host 5432 was already taken by an unrelated local Postgres install;
+      # 5433 avoids that conflict. Container-internal port stays 5432, so
+      # this only affects DATABASE_URL_ADMIN/DATABASE_URL_AGENT's host part.
+      - "127.0.0.1:5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./apps/server/migrations:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d launchpad"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
   launchpad:
     build:
       context: .
@@ -33,3 +54,6 @@ services:
     pids_limit: 512
     mem_limit: 4g
     cpus: 2
+
+volumes:
+  pgdata:

@@ -16,7 +16,15 @@ export async function addTaint(store: JsonStore, jti: string, label: Label): Pro
 }
 
 // Level B (explanatory): name the origin of copied-through content.
-// ponytail: in-memory shingle index keyed by run; B3 may replace with a persistent one.
+//
+// `index` is an in-memory hot cache so matchOrigin() — called synchronously
+// on every egress check, mid tool-call — never has to await a store read.
+// Persistence (B3) piggybacks on top of it rather than replacing it:
+// fingerprint() writes through to the JsonStore (hashes + label only, never
+// the raw content that produced them) so a server restart mid-demo doesn't
+// silently drop Scene 2's provenance data, and loadFingerprints() rehydrates
+// this cache from the store once at startup, before any request reaches the
+// gateway.
 const index = new Map<string, { label: Label; hashes: Set<string> }[]>();
 
 function shingles(text: string): string[] {
@@ -29,10 +37,31 @@ function shingles(text: string): string[] {
   return out;
 }
 
-export function fingerprint(runId: string, label: Label, content: string): void {
+/** Call once at startup, before the gateway accepts requests. */
+export function loadFingerprints(store: JsonStore): void {
+  index.clear();
+  for (const entry of store.snapshot().fingerprints) {
+    const list = index.get(entry.runId) ?? [];
+    list.push({ label: entry.label, hashes: new Set(entry.hashes) });
+    index.set(entry.runId, list);
+  }
+}
+
+export function fingerprint(store: JsonStore, runId: string, label: Label, content: string): void {
+  const hashes = shingles(content);
   const list = index.get(runId) ?? [];
-  list.push({ label, hashes: new Set(shingles(content)) });
+  list.push({ label, hashes: new Set(hashes) });
   index.set(runId, list);
+
+  // Fire-and-forget: JsonStore.mutate() queues and persists atomically on
+  // its own, so this doesn't need to block the tool call that triggered it.
+  // A failed write here degrades to "this one read has no persisted
+  // provenance if the server restarts" — never to a blocked or corrupted
+  // tool call, and never to the hot cache above disagreeing with it, since
+  // the cache was already updated synchronously either way.
+  void store.mutate((d) => {
+    d.fingerprints.push({ runId, label, hashes });
+  }).catch(() => {});
 }
 
 export function matchOrigin(runId: string, payload: string): Label | null {
@@ -43,6 +72,9 @@ export function matchOrigin(runId: string, payload: string): Label | null {
   return null;
 }
 
-export function clearFingerprints(runId: string): void {
+export function clearFingerprints(store: JsonStore, runId: string): void {
   index.delete(runId);
+  void store.mutate((d) => {
+    d.fingerprints = d.fingerprints.filter((f) => f.runId !== runId);
+  }).catch(() => {});
 }
