@@ -46,12 +46,12 @@ const toolOptions: ReadonlyArray<{
   label: string;
   description: string;
 }> = [
-  { scope: "workspace:read", label: "Read workspaces", description: "Read files through the audited gateway." },
-  { scope: "workspace:write", label: "Write workspaces", description: "Write files through the audited gateway." },
-  { scope: "crm:read", label: "Read CRM", description: "Read CRM records for this tenant." },
-  { scope: "crm:write", label: "Write CRM", description: "Create or update tenant CRM notes." },
-  { scope: "webhook:send", label: "Send webhooks", description: "Request external egress through the gateway." },
-];
+    { scope: "workspace:read", label: "Read workspaces", description: "Read files through the audited gateway." },
+    { scope: "workspace:write", label: "Write workspaces", description: "Write files through the audited gateway." },
+    { scope: "crm:read", label: "Read CRM", description: "Read CRM records for this tenant." },
+    { scope: "crm:write", label: "Write CRM", description: "Create or update tenant CRM notes." },
+    { scope: "webhook:send", label: "Send webhooks", description: "Request external egress through the gateway." },
+  ];
 
 const demoUsers = [
   { id: "user-jean", name: "Jean" },
@@ -739,9 +739,9 @@ export default function App() {
           refreshApprovals(),
           ...(selectedAgentId
             ? [
-                refreshGrants(selectedAgentId),
-                refreshEvents(selectedAgentId, timelineFilterRef.current),
-              ]
+              refreshGrants(selectedAgentId),
+              refreshEvents(selectedAgentId, timelineFilterRef.current),
+            ]
             : []),
         ]);
       }
@@ -777,7 +777,9 @@ export default function App() {
         setSecurityNotice("Grant revoked. The next protected call will be checked without it.");
         await Promise.all([
           refreshApprovals(),
-          refreshEvents(agentId, timelineFilterRef.current),
+          ...(agentId
+            ? [refreshEvents(agentId, timelineFilterRef.current)]
+            : []),
         ]);
       }
     } catch (reason) {

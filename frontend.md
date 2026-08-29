@@ -510,6 +510,8 @@ At this stage, Agent Settings, grants, approvals, revoke, and kill are visible.
 
 ## Part 4 — Audit timeline and blocked-action rendering
 
+**Status: implemented.** Audit timeline with policy/all filter toggle, event polling, timeline row rendering with color-coded outcomes and actor/action flows, IFC egress denial blocks, and blocked-action callouts in the playground are implemented. Web typecheck and production build pass.
+
 This exposes the existing backend evidence.
 
 ### 4.1 Event types and API methods
