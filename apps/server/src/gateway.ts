@@ -16,10 +16,11 @@ import path from "node:path";
 import { z } from "zod";
 import { recordEvent } from "./audit.js";
 import { createCardOnDeny } from "./approvals.js";
+import { classify } from "./classify.js";
 import { findLiveGrant } from "./grants.js";
 import { addTaint, checkEgress, fingerprint, matchOrigin } from "./ifc.js";
 import type { JsonStore } from "./store.js";
-import type { Agent, Egress, GrantAction, Label, Resource, RunToken, Scope } from "./types.js";
+import type { Agent, Egress, GrantAction, Label, Resource, RunToken, Scope, SecurityLevel } from "./types.js";
 
 export interface AgentClaims {
   sub: string; // agentId
@@ -146,7 +147,19 @@ export const gatewayPlugin: FastifyPluginAsync<GatewayDeps> = async (app, deps) 
     return full;
   };
 
-  const labelFor = (grantId: string, target: Agent, egress: Egress[]): Label => ({ grantId, origin: target.ownerId + "/" + target.name, egress });
+  const labelFor = (grantId: string, target: Agent, egress: Egress[], level: SecurityLevel): Label => ({ grantId, origin: target.ownerId + "/" + target.name, egress, level });
+
+  /**
+   * Info tagging for reads of the agent's *own* resources. No taint (chat and
+   * tool egress toward the owner's own things stay exactly as they are) — but
+   * a secret-shaped read is fingerprinted so the output screen can catch it
+   * being printed into chat. Full egress on the label keeps checkEgress inert
+   * for it even if such a label ever reached a taint list.
+   */
+  const tagSelfRead = (ctx: Ctx, origin: string, content: string, level: SecurityLevel): void => {
+    if (level !== "secret") return;
+    fingerprint(store, ctx.run, { grantId: "self", origin, egress: ["internal", "agent", "external"], level }, content);
+  };
 
   // ---- build a per-request MCP server whose tools close over the authenticated ctx ----
   function buildServer(ctx: Ctx): McpServer {
@@ -193,9 +206,11 @@ export const gatewayPlugin: FastifyPluginAsync<GatewayDeps> = async (app, deps) 
         const { target, grant } = resolveWorkspace(ctx, agent, "read");
         const text = await readFile(jail(target.id, rel), "utf8");
         if (grant) {
-          const label = labelFor(grant.id, target, grant.egress);
+          const label = labelFor(grant.id, target, grant.egress, classify("granted-workspace", text));
           await addTaint(store, ctx.jti, label);
           fingerprint(store, ctx.run, label, text);
+        } else {
+          tagSelfRead(ctx, target.ownerId + "/" + target.name, text, classify("own-workspace", text));
         }
         return text;
       });
@@ -230,6 +245,8 @@ export const gatewayPlugin: FastifyPluginAsync<GatewayDeps> = async (app, deps) 
         const rows = customer
           ? await q("SELECT id, owner_id, customer, note FROM crm_records WHERE customer = $1", [customer])
           : await q("SELECT id, owner_id, customer, note FROM crm_records ORDER BY customer");
+        const serialized = JSON.stringify(rows.rows);
+        tagSelfRead(ctx, ctx.ownerId + "/crm", serialized, classify("crm", serialized));
         return rows.rows;
       });
     }));
