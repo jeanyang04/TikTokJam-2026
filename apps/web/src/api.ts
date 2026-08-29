@@ -4,8 +4,10 @@ import type {
   AgentRun,
   ApprovalDecision,
   ApprovalRequest,
+  EventFilter,
   Message,
   PolicyGrant,
+  RunEvent,
   SystemInfo,
 } from "./types";
 
@@ -131,6 +133,14 @@ export const api = {
     request<{ messages: Message[] }>("/api/agents/" + id + "/messages"),
   runs: (id: string) =>
     request<{ runs: AgentRun[] }>("/api/agents/" + id + "/runs"),
+  getAgentEvents: (id: string, filter: EventFilter, limit = 200) =>
+    request<{ events: RunEvent[] }>(
+      "/api/agents/" + id + "/events?filter=" + filter + "&limit=" + limit,
+    ),
+  getRunEvents: (id: string, filter: EventFilter) =>
+    request<{ events: RunEvent[] }>(
+      "/api/runs/" + id + "/events?filter=" + filter,
+    ),
   sendMessage: (id: string, content: string) =>
     request<{ run: AgentRun; message: Message }>(
       "/api/agents/" + id + "/messages",

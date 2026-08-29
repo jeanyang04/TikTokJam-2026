@@ -12,8 +12,10 @@ import type {
   AgentRun,
   ApprovalDecision,
   ApprovalRequest,
+  EventFilter,
   Message,
   PolicyGrant,
+  RunEvent,
   Scope,
   SystemInfo,
 } from "./types";
@@ -101,8 +103,29 @@ function formatDateTime(value: string): string {
   }).format(new Date(value));
 }
 
+function formatEventTime(value: string): string {
+  return new Intl.DateTimeFormat(undefined, {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  }).format(new Date(value));
+}
+
 function shortId(value: string): string {
   return value.length > 12 ? value.slice(0, 8) + "…" : value;
+}
+
+function formatEventLabel(value: string): string {
+  return value.replaceAll("_", " ");
+}
+
+function formatDetailValue(value: unknown): string {
+  if (typeof value === "string") return value;
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
 }
 
 function grantState(grant: PolicyGrant): "active" | "expired" | "revoked" {
@@ -301,6 +324,9 @@ export default function App() {
   const [grants, setGrants] = useState<PolicyGrant[]>([]);
   const [grantsLoading, setGrantsLoading] = useState(false);
   const [revokingGrantId, setRevokingGrantId] = useState<string | null>(null);
+  const [events, setEvents] = useState<RunEvent[]>([]);
+  const [eventsLoading, setEventsLoading] = useState(false);
+  const [eventFilter, setEventFilter] = useState<EventFilter>("policy");
   const [killingAgent, setKillingAgent] = useState(false);
   const [securityNotice, setSecurityNotice] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -312,8 +338,11 @@ export default function App() {
   const mountedRef = useRef(true);
   const pollingRunIds = useRef(new Set<string>());
   const sessionVersionRef = useRef(0);
+  const eventRequestRef = useRef(0);
+  const timelineFilterRef = useRef<EventFilter>(eventFilter);
   const initialUserRef = useRef(currentUser);
   selectedIdRef.current = selectedId;
+  timelineFilterRef.current = eventFilter;
 
   const selected = useMemo(
     () => agents.find((agent) => agent.id === selectedId) ?? null,
@@ -324,6 +353,26 @@ export default function App() {
       .filter((approval) => approval.status === "pending")
       .sort((left, right) => right.createdAt.localeCompare(left.createdAt)),
     [approvals],
+  );
+  const latestBlockedEvent = useMemo(() => {
+    if (!activeRun) return null;
+    const policyEvents = events.filter(
+      (event) =>
+        event.runId === activeRun.id &&
+        ["gateway", "approval", "grant"].includes(event.kind),
+    );
+    const latest = policyEvents.at(-1) ?? null;
+    return latest?.decision === "deny" ? latest : null;
+  }, [activeRun, events]);
+  const blockedEventHasCard = useMemo(
+    () =>
+      latestBlockedEvent !== null &&
+      pendingApprovals.some(
+        (approval) =>
+          approval.agentId === latestBlockedEvent.agentId &&
+          approval.runId === latestBlockedEvent.runId,
+      ),
+    [latestBlockedEvent, pendingApprovals],
   );
 
   const clearSession = useCallback((message: string | null = null) => {
@@ -348,6 +397,10 @@ export default function App() {
     setGrants([]);
     setGrantsLoading(false);
     setRevokingGrantId(null);
+    eventRequestRef.current += 1;
+    setEvents([]);
+    setEventsLoading(false);
+    setEventFilter("policy");
     setKillingAgent(false);
     setSecurityNotice(null);
     setBusy(false);
@@ -398,6 +451,38 @@ export default function App() {
         selectedIdRef.current === agentId
       ) {
         setGrantsLoading(false);
+      }
+    }
+  }, []);
+
+  const refreshEvents = useCallback(async (
+    agentId: string,
+    filter: EventFilter,
+    showLoading = false,
+  ) => {
+    const sessionVersion = sessionVersionRef.current;
+    const requestId = ++eventRequestRef.current;
+    if (showLoading) setEventsLoading(true);
+    try {
+      const result = await api.getAgentEvents(agentId, filter);
+      if (
+        mountedRef.current &&
+        sessionVersion === sessionVersionRef.current &&
+        requestId === eventRequestRef.current &&
+        selectedIdRef.current === agentId &&
+        timelineFilterRef.current === filter
+      ) {
+        setEvents(result.events);
+      }
+    } finally {
+      if (
+        mountedRef.current &&
+        sessionVersion === sessionVersionRef.current &&
+        requestId === eventRequestRef.current &&
+        selectedIdRef.current === agentId &&
+        timelineFilterRef.current === filter
+      ) {
+        setEventsLoading(false);
       }
     }
   }, []);
@@ -487,6 +572,31 @@ export default function App() {
       window.clearInterval(timer);
     };
   }, [authRequired, currentUser, refreshApprovals]);
+
+  useEffect(() => {
+    if (authRequired !== false || !currentUser || !selectedId) {
+      eventRequestRef.current += 1;
+      setEvents([]);
+      setEventsLoading(false);
+      return;
+    }
+    let cancelled = false;
+    const load = (showLoading: boolean) => {
+      void refreshEvents(selectedId, eventFilter, showLoading).catch((reason) => {
+        if (!cancelled && !(reason instanceof ApiError && reason.status === 401)) {
+          setError(reason instanceof Error ? reason.message : String(reason));
+        }
+      });
+    };
+    setEvents([]);
+    load(true);
+    const timer = window.setInterval(() => load(false), 2_000);
+    return () => {
+      cancelled = true;
+      eventRequestRef.current += 1;
+      window.clearInterval(timer);
+    };
+  }, [authRequired, currentUser, eventFilter, refreshEvents, selectedId]);
 
   useEffect(() => {
     setActiveRun(null);
@@ -627,7 +737,12 @@ export default function App() {
         await Promise.all([
           refreshAgents(),
           refreshApprovals(),
-          ...(selectedAgentId ? [refreshGrants(selectedAgentId)] : []),
+          ...(selectedAgentId
+            ? [
+                refreshGrants(selectedAgentId),
+                refreshEvents(selectedAgentId, timelineFilterRef.current),
+              ]
+            : []),
         ]);
       }
     } catch (reason) {
@@ -660,6 +775,10 @@ export default function App() {
           current.map((item) => item.id === revoked.id ? revoked : item),
         );
         setSecurityNotice("Grant revoked. The next protected call will be checked without it.");
+        await Promise.all([
+          refreshApprovals(),
+          refreshEvents(agentId, timelineFilterRef.current),
+        ]);
       }
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
@@ -697,6 +816,10 @@ export default function App() {
         setSecurityNotice(
           killed.name + "'s active identity was revoked and its gateway tools were removed.",
         );
+        await Promise.all([
+          refreshApprovals(),
+          refreshEvents(agentId, timelineFilterRef.current),
+        ]);
       }
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
@@ -729,7 +852,13 @@ export default function App() {
           setActiveRun(result.run);
         }
         if (!["queued", "running"].includes(result.run.status)) {
-          await Promise.all([refreshMessages(agentId), refreshAgents()]);
+          await Promise.all([
+            refreshMessages(agentId),
+            refreshAgents(),
+            ...(selectedIdRef.current === agentId
+              ? [refreshEvents(agentId, timelineFilterRef.current)]
+              : []),
+          ]);
           return;
         }
       }
@@ -781,6 +910,9 @@ export default function App() {
       setActiveRun(null);
       setApprovals([]);
       setGrants([]);
+      eventRequestRef.current += 1;
+      setEvents([]);
+      setEventFilter("policy");
       setSecurityNotice(null);
       await bootstrap();
       if (mountedRef.current) setAuthRequired(false);
@@ -1210,6 +1342,22 @@ export default function App() {
               </div>
             </section>
 
+            {latestBlockedEvent && (
+              <aside className="policy-blocked-callout" role="alert">
+                <div className="policy-blocked-icon">!</div>
+                <div>
+                  <strong>Action blocked by policy</strong>
+                  <p>
+                    {selected.name} could not {formatEventLabel(latestBlockedEvent.action)} → {latestBlockedEvent.resource}.
+                    {latestBlockedEvent.reason ? " Reason: " + latestBlockedEvent.reason + "." : ""}
+                  </p>
+                  {blockedEventHasCard && (
+                    <span>An Access Request Card is pending.</span>
+                  )}
+                </div>
+              </aside>
+            )}
+
             <section className="playground">
               <div className="playground-topbar">
                 <div>
@@ -1314,6 +1462,112 @@ export default function App() {
                   </button>
                 </div>
               </form>
+            </section>
+
+            <section className="timeline-panel" aria-label="Agent audit timeline">
+              <div className="timeline-heading">
+                <div>
+                  <span className="eyebrow">Backend evidence</span>
+                  <h2>Audit timeline</h2>
+                  <p>Human → agent → action → resource → outcome. Event details are redacted by the server.</p>
+                </div>
+                <div className="timeline-filters" aria-label="Timeline filter">
+                  <button
+                    className={eventFilter === "policy" ? "selected" : ""}
+                    aria-pressed={eventFilter === "policy"}
+                    onClick={() => setEventFilter("policy")}
+                  >
+                    Policy only
+                  </button>
+                  <button
+                    className={eventFilter === "all" ? "selected" : ""}
+                    aria-pressed={eventFilter === "all"}
+                    onClick={() => setEventFilter("all")}
+                  >
+                    All activity
+                  </button>
+                </div>
+              </div>
+
+              {eventsLoading ? (
+                <div className="timeline-empty"><Spinner /> Loading audit events…</div>
+              ) : events.length === 0 ? (
+                <div className="timeline-empty">
+                  <strong>No {eventFilter === "policy" ? "policy" : "activity"} events yet</strong>
+                  <span>Gateway decisions, approvals, grants, and runtime telemetry will appear here.</span>
+                </div>
+              ) : (
+                <ol className="timeline-list">
+                  {events.map((event) => {
+                    const eventAgent = agents.find((agent) => agent.id === event.agentId);
+                    const owner = event.ownerId === currentUser?.id
+                      ? currentUser.name
+                      : event.ownerId;
+                    const detailEntries = Object.entries(event.detail);
+                    const origin = typeof event.detail.origin === "string"
+                      ? event.detail.origin
+                      : null;
+                    const grantId = typeof event.detail.grantId === "string"
+                      ? event.detail.grantId
+                      : null;
+                    return (
+                      <li
+                        className={
+                          "timeline-row timeline-row-" + (event.decision ?? "neutral")
+                        }
+                        key={event.id}
+                      >
+                        <time dateTime={event.at}>{formatEventTime(event.at)}</time>
+                        <div className="timeline-marker" aria-hidden="true" />
+                        <article>
+                          <div className="timeline-row-heading">
+                            <span className={"timeline-kind timeline-kind-" + event.kind}>
+                              {formatEventLabel(event.kind)}
+                            </span>
+                            <span className={"timeline-outcome timeline-outcome-" + (event.decision ?? "neutral")}>
+                              {event.decision ?? "recorded"}
+                            </span>
+                          </div>
+                          <div className="timeline-actor">
+                            <strong>{owner}</strong>
+                            <span>→</span>
+                            <strong>{eventAgent?.name ?? shortId(event.agentId)}</strong>
+                          </div>
+                          <div className="timeline-action">
+                            <code>{event.action}</code>
+                            <span>→</span>
+                            <code>{event.resource}</code>
+                          </div>
+                          {event.reason && (
+                            <p className="timeline-reason">Reason: {event.reason}</p>
+                          )}
+                          {event.reason === "ifc" && (
+                            <div className="timeline-ifc">
+                              <strong>Blocked external egress</strong>
+                              {origin && <span>Content originated from: {origin}</span>}
+                              {grantId && <span>Grant: {shortId(grantId)}</span>}
+                              <span>Destination: {event.resource}</span>
+                            </div>
+                          )}
+                          {detailEntries.length > 0 && (
+                            <details className="timeline-details">
+                              <summary>Redacted event details</summary>
+                              <dl>
+                                {detailEntries.map(([key, value]) => (
+                                  <div key={key}>
+                                    <dt>{formatEventLabel(key)}</dt>
+                                    <dd>{formatDetailValue(value)}</dd>
+                                  </div>
+                                ))}
+                              </dl>
+                            </details>
+                          )}
+                        </article>
+                      </li>
+                    );
+                  })}
+                </ol>
+              )}
             </section>
           </>
         ) : (

@@ -40,6 +40,30 @@ export type ApprovalSource = "live_deny" | "nl_intent";
 export type ApprovalKind = "scope" | "grant" | "declassify";
 export type ApprovalDecision = "allow_run" | "allow_always" | "deny";
 export type ApprovalStatus = "pending" | ApprovalDecision;
+export type EventFilter = "policy" | "all";
+export type RunEventKind =
+  | "command"
+  | "file_change"
+  | "mcp_call"
+  | "gateway"
+  | "approval"
+  | "grant"
+  | "llm";
+export type EventDecision = "allow" | "deny" | "pending";
+
+export interface RunEvent {
+  id: string;
+  runId: string | null;
+  agentId: string;
+  ownerId: string;
+  at: string;
+  kind: RunEventKind;
+  action: string;
+  resource: string;
+  decision: EventDecision | null;
+  reason: string | null;
+  detail: Record<string, unknown>;
+}
 
 export interface ApprovalRequest {
   id: string;
