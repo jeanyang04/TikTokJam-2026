@@ -16,8 +16,16 @@ import { WorkspaceManager } from "./workspace.js";
  * agent keeps its id (grants, RunTokens and RunEvents all reference it) while
  * its permissions, temp scopes, Codex thread and grants go back to the baseline
  * below, so the second run-through starts from the same deny the first one did.
- * It does not truncate the store. Agents outside the cast, grants that are not
- * wholly inside it, and the whole audit trail are left as they were.
+ * By default it does not truncate the store. Agents outside the cast, grants
+ * that are not wholly inside it, and the whole audit trail are left as they
+ * were.
+ *
+ * **`reset: true` (`npm run seed -- --reset`) clears the stage instead.** Every
+ * agent outside the cast is removed and its workspace archived, and the
+ * message, run, token, grant, approval, audit and fingerprint tables are
+ * emptied. It is opt-in precisely because the default above is a promise other
+ * people's data relies on: a bare seed is safe to run against a store that is
+ * not only yours, and this is not.
  *
  * It writes rows directly rather than through `AgentService`, so the reset is
  * one `store.mutate`, and it writes no RunEvents: this is the operator setting
@@ -126,12 +134,33 @@ export interface SeedInput {
   workspaceRoot: string;
   /** Raw `SEED_USERS`; the owners above must be users this deployment can log in as. */
   seedUsers: string;
+  /**
+   * Clear the stage: drop every agent outside the cast and empty the history
+   * tables. Off by default — see the note at the top of this file about why
+   * this is opt-in.
+   */
+  reset?: boolean | undefined;
+}
+
+/** Rows dropped by `reset`, for the operator to read back. */
+export interface PurgeCounts {
+  messages: number;
+  runs: number;
+  runTokens: number;
+  policyGrants: number;
+  approvals: number;
+  runEvents: number;
+  fingerprints: number;
 }
 
 export interface SeedResult {
   created: string[];
   reset: string[];
   grantsRevoked: number;
+  /** Names of agents removed by `reset`. Empty unless it was asked for. */
+  removed: string[];
+  /** Null unless `reset` was asked for. */
+  purged: PurgeCounts | null;
 }
 
 /** An agent is the same fixture when the owner and the name match. */
@@ -164,13 +193,18 @@ export async function seedDemoFixtures(input: SeedInput): Promise<SeedResult> {
   const created: string[] = [];
   const reset: string[] = [];
 
-  const { agents, grantsRevoked } = await input.store.mutate((database) => {
+  const { agents, grantsRevoked, removed, purged } = await input.store.mutate((database) => {
     // The RunToken row is authoritative, so resetting under a live run would
     // leave that run working while silently taking the scopes off the *next*
     // one. A reset that only half applies is worse than one that refuses.
-    const busy = FIXTURE_AGENTS.map((fixture) => findFixture(database, fixture)).filter(
-      (agent) => agent?.status === "busy",
-    );
+    //
+    // `reset` widens this to every agent, not just the cast: it deletes rows a
+    // live run outside the cast is still writing against.
+    const busy = (
+      input.reset
+        ? database.agents
+        : FIXTURE_AGENTS.map((fixture) => findFixture(database, fixture))
+    ).filter((agent) => agent?.status === "busy");
     if (busy.length > 0) {
       throw new HttpError(
         409,
@@ -214,12 +248,47 @@ export async function seedDemoFixtures(input: SeedInput): Promise<SeedResult> {
       seeded.push({ agent, fixture });
     }
 
+    const cast = new Set(seeded.map((entry) => entry.agent.id));
+    const castOwners = new Set(seeded.map((entry) => entry.agent.ownerId));
+
+    // Clearing the stage. Everything below references an agent id, so the
+    // agents go last and the tables that point at them go first; emptying them
+    // wholesale is the point, rather than filtering to the cast, because a
+    // rehearsal's own runs and audit rows are exactly what makes the next
+    // run-through unreadable.
+    if (input.reset) {
+      const dropped = database.agents.filter((agent) => !cast.has(agent.id));
+      const counts: PurgeCounts = {
+        messages: database.messages.length,
+        runs: database.runs.length,
+        runTokens: database.runTokens.length,
+        policyGrants: database.policyGrants.length,
+        approvals: database.approvals.length,
+        runEvents: database.runEvents.length,
+        fingerprints: database.fingerprints.length,
+      };
+      database.messages = [];
+      database.runs = [];
+      database.runTokens = [];
+      database.policyGrants = [];
+      database.approvals = [];
+      database.runEvents = [];
+      database.fingerprints = [];
+      database.agents = database.agents.filter((agent) => cast.has(agent.id));
+      return {
+        agents: seeded,
+        grantsRevoked: counts.policyGrants,
+        // The path is what the caller needs to archive the workspace, and the
+        // row is gone from the store by the time it gets there.
+        removed: dropped.map((agent) => ({ name: agent.name, workspacePath: agent.workspacePath })),
+        purged: counts,
+      };
+    }
+
     // Scene 1 ends by writing a grant on Writer's workspace, and leaving it live
     // would make the next run-through's first tool call succeed. Only grants
     // wholly inside the cast are revoked: a bystander agent granted read of
     // Writer's workspace is somebody's real configuration, not demo state.
-    const cast = new Set(seeded.map((entry) => entry.agent.id));
-    const castOwners = new Set(seeded.map((entry) => entry.agent.ownerId));
     let revoked = 0;
     for (const grant of database.policyGrants) {
       if (grant.revokedAt !== null) continue;
@@ -230,8 +299,24 @@ export async function seedDemoFixtures(input: SeedInput): Promise<SeedResult> {
       grant.revokedAt = timestamp;
       revoked += 1;
     }
-    return { agents: seeded, grantsRevoked: revoked };
+    return {
+      agents: seeded,
+      grantsRevoked: revoked,
+      removed: [] as Array<{ name: string; workspacePath: string }>,
+      purged: null as PurgeCounts | null,
+    };
   });
+
+  // Archived rather than deleted, and after the mutate rather than inside it:
+  // `store.mutate` is the atomic unit, and a failed rename must not be able to
+  // roll back a store write that already happened. A workspace that was never
+  // created is not an error — the row outliving the directory is the normal
+  // shape of a half-finished agent.
+  for (const agent of removed) {
+    await workspaces
+      .archive({ id: path.basename(agent.workspacePath), workspacePath: agent.workspacePath } as Agent)
+      .catch(() => undefined);
+  }
 
   for (const { agent, fixture } of agents) {
     // `WorkspaceManager.create` uses `recursive: false` and would throw on the
@@ -252,11 +337,12 @@ export async function seedDemoFixtures(input: SeedInput): Promise<SeedResult> {
     }
   }
 
-  return { created, reset, grantsRevoked };
+  return { created, reset, grantsRevoked, removed: removed.map((agent) => agent.name), purged };
 }
 
 async function main(): Promise<void> {
   const config = loadConfig();
+  const reset = process.argv.includes("--reset");
   const store = new JsonStore(path.join(config.dataDirectory, "launchpad.json"));
   await store.initialize();
   // The busy guard and the unknown-owner refusal both carry a message written
@@ -267,6 +353,7 @@ async function main(): Promise<void> {
       store,
       workspaceRoot: config.workspaceRoot,
       seedUsers: config.seedUsers,
+      reset,
     });
   } catch (error) {
     process.stderr.write((error as Error).message + "\n");
@@ -279,12 +366,21 @@ async function main(): Promise<void> {
   // operator they seeded a store the server is not reading.
   process.stdout.write(
     [
-      "Seeded demo fixtures",
+      reset ? "Seeded demo fixtures and cleared the stage" : "Seeded demo fixtures",
       "  store:      " + path.join(config.dataDirectory, "launchpad.json"),
       "  workspaces: " + config.workspaceRoot,
       "  created: " + (result.created.join(", ") || "none"),
       "  reset:   " + (result.reset.join(", ") || "none"),
-      "  grants revoked: " + result.grantsRevoked,
+      ...(result.purged
+        ? [
+            "  removed: " + (result.removed.join(", ") || "none"),
+            "  workspaces archived to " + path.join(config.workspaceRoot, ".deleted"),
+            "  purged:  " +
+              Object.entries(result.purged)
+                .map(([table, count]) => count + " " + table)
+                .join(", "),
+          ]
+        : ["  grants revoked: " + result.grantsRevoked]),
       "",
     ].join("\n"),
   );

@@ -153,6 +153,25 @@ export class AgentService {
   }
 
   /**
+   * What this run was allowed to do, for the UI to show against what the agent
+   * holds standing. Derived from the RunToken rather than returning it: the
+   * row carries a `jti` the browser has no business seeing.
+   *
+   * A run with no token (or one minted before task-scoped permissions) reports
+   * nothing withheld, which is the truth about it — it was never narrowed.
+   */
+  getRunScopes(runId: string): { active: Scope[]; withheld: Scope[]; estimated: Scope[] } {
+    const token = this.store
+      .snapshot()
+      .runTokens.find((item) => item.runId === runId);
+    return {
+      active: token?.scp ?? [],
+      withheld: token?.withheld ?? [],
+      estimated: token?.estimated ?? [],
+    };
+  }
+
+  /**
    * The same check for `/api/grants/:id*`. `grants.ts` refuses another tenant's
    * grant too, but silently — the gate is where the 403 becomes an audit row,
    * and where an unknown id stays a bare 404. The event's `agentId` is the
@@ -493,6 +512,17 @@ export class AgentService {
       resource: from.name + "/workspace",
       action,
       scope: null,
+      // The human asked for this themselves, in these words, before any run
+      // touched anything. There is nothing to be alarmed about and nothing to
+      // juxtapose it against.
+      risk: "routine",
+      evidence: {
+        userAsked: text.length > 300 ? text.slice(0, 300) + "…" : text,
+        attempting: action + " on " + from.name + "/workspace",
+        outsideTaskScope: false,
+        untrustedOrigin: null,
+        classifiedOrigin: null,
+      },
       grant: {
         fromOwner: callerId,
         fromAgent: from.id,
@@ -698,6 +728,13 @@ export class AgentService {
         scp,
         taints: sameConversation ? structuredClone(previousToken.taints) : [],
         egressAllow: [],
+        // Both recorded rather than recomputed later: `estimated` is the
+        // baseline a card is judged against (a scope the agent reaches for
+        // that is not in here is one the user never asked for), and
+        // `withheld` cannot be reconstructed once the agent's standing
+        // permissions change.
+        estimated,
+        withheld: standing.filter((scope) => !scp.includes(scope)),
         threadId: storedAgent.codexThreadId,
         issuedAt: timestamp,
         expiresAt: new Date(Date.parse(timestamp) + this.config.codexTimeoutMs + 60_000)
@@ -787,6 +824,17 @@ export class AgentService {
         scope,
         grant: null,
         reason: "this task looks like it needs " + scope + ", which this agent doesn't have",
+        // Routine by construction: this scope is in the estimate, which is
+        // what "the task needs it" means, and no tool has run yet so there is
+        // no untrusted content to be wary of.
+        risk: "routine",
+        evidence: {
+          userAsked: run.prompt.length > 300 ? run.prompt.slice(0, 300) + "…" : run.prompt,
+          attempting: "use " + scope + " for this task",
+          outsideTaskScope: false,
+          untrustedOrigin: null,
+          classifiedOrigin: null,
+        },
       });
     }
   }
@@ -844,10 +892,23 @@ export class AgentService {
         prompt: run.prompt,
         threadId: agentAtStart.codexThreadId,
         token,
-        // tools comes from the token's scope set, not the agent's permanent tools:
-        // B2 builds Codex's enabled_tools from this, so an "Allow for this run"
-        // scope would otherwise never reach the model's menu (docs/SEAMS.md).
-        permissions: { ...agentAtStart.permissions, tools: runToken.scp },
+        // The model's menu is `scp ∪ withheld`, not `scp`. Two reasons it is
+        // not just the agent's permanent tools: an "Allow for this run" scope
+        // lives on the token and would otherwise never reach the menu, and a
+        // scope the agent no longer holds must not reappear on it.
+        //
+        // **Withheld tools stay on the menu on purpose.** Enforcement is the
+        // token's `scp`, checked at the gateway, so offering a withheld tool
+        // grants nothing — the call is denied and raises a card. Hiding it
+        // instead makes the narrowing invisible: a prompt injection reaching
+        // for a tool that is not there looks identical to a model that simply
+        // chose not to call it, and there is no denial, no card, and no audit
+        // row to show anyone. An attempt that is refused is evidence; an
+        // attempt that never happens is not (docs/SEAMS.md).
+        permissions: {
+          ...agentAtStart.permissions,
+          tools: [...new Set([...runToken.scp, ...runToken.withheld])],
+        },
       });
       // Chat is the third egress surface: the reply becomes a stored message
       // that gets screenshotted and pasted, so an agent blocked from *sending*
