@@ -630,114 +630,38 @@ to `"internal"` makes confidential copied-through content block too — pinned i
 
 ---
 
-## Task-scoped permissions (`scope-estimator.ts` new, `agent-service.ts`, `config.ts`, `index.ts`)
+## Task-scoped permissions — REMOVED (was `scope-estimator.ts`, `agent-service.ts`, `config.ts`, `index.ts`)
 
-**Landed (item 2):** `RunToken.scp` is now `effectiveScopes(agent) ∩ estimate(prompt)`.
-An agent may hold five scopes permanently; a task that only reads a document gets a
-token that only reads documents, so a planted instruction cannot reach a tool the task
-never required. Because `executeRun` already hands the runner
-`permissions: {…, tools: runToken.scp}` and B2 builds Codex's `enabled_tools` from that,
-the narrowed tool is off the **model's menu**, not merely denied at the gateway.
+**Landed (item 2), removed 2026-08-30.** The estimator narrowed `RunToken.scp` to
+`effectiveScopes(agent) ∩ estimate(prompt)` and raised an up-front `source:"nl_intent"`,
+`kind:"scope"` card per scope the estimate wanted and the agent lacked. In practice the
+estimate over-asked — a read-only task drew a `workspace:write` card (the keyword
+grammar's no-match fallback was the workspace *pair*, and the Ark path could over-include
+on its own judgment) — so the operator saw spurious cards for scopes no task needed. The
+whole layer is out.
 
-**The rule this implements, and the one to keep: removing permissions is automatic and
-needs no human; adding one always needs a card.** (Progent, arXiv 2504.11703.) Nothing
-in this path grants anything. If you find yourself writing code where the system widens
-a scope, a trust or a destination on its own, that is the thing to stop and raise.
+What "out" means on the seams:
 
-**`Agent.permissions.tools` is not a third writer.** The docs above name two (an owner's
-PATCH, `allow_always`); the narrowing is **not** one of them. It lives on the run token
-and dies with the run — never write it back to the agent.
+- `RunToken.scp` is `effectiveScopes(agent)` again (tools ∪ live tempScopes), exactly the
+  pre-estimator mint. The tempScopes union that the narrowing had to special-case is just
+  `effectiveScopes` doing its normal job now.
+- `PERMISSION_ESTIMATOR_ENABLED` is gone from `config.ts` and `.env.example`.
+- `AgentService`'s constructor is back to five arguments; the 5th (`parseGrantIntent`) is
+  the last, and `index.ts` passes only the first four.
+- **`gateway.ts` is once again the sole source of `kind:"scope"` cards, and it always
+  passes `ctx.jti`** — so the NL-grants section's `allow_run` guard note above holds as
+  written, with no exception to remember. `approvals.ts`'s scope branch is untouched; it
+  still serves the gateway's cards.
+- The "⚠ This changes demo Scene 2" consequence this section used to carry is reverted:
+  `webhook:send` from `seed.ts` stays on the token, Scene 2's exfil attempt reaches the
+  IFC check live, and `/demo/replay` works again with no env-var caveat.
 
-**The estimator's input is the user's message text and nothing else.** Not tool output,
-not file content, not a prior assistant turn. It runs before any tool executes, so
-nothing untrusted can influence it. That is a security property, not a convenience.
-
-**The constructor default is the offline keyword grammar, and `index.ts` injects the
-Ark-backed one.** The handoff asked for "LLM-backed when the model is configured", but
-every harness in the suite sets `ARK_API_KEY: "test-key"` (and `sendMessage` 503s
-without it), so `isArkConfigured` is true in *every* test: an Ark-first constructor
-default would put a real network call in the path of every test that sends a message.
-`AgentService`'s 6th constructor argument is the estimator, the 5th is `parseGrantIntent`
-— pass both when you construct it by hand.
-
-**Empty estimate = the standing set.** Disabled by `PERMISSION_ESTIMATOR_ENABLED=false`,
-an estimator that throws, one that answers `[]`, or one whose answer is not a `Scope`
-(filtered against `SCOPES`, because the Ark path's answer is model output) all land on
-exactly today's behaviour. Fail to the status quo, never to a broken run.
-
-**An empty *intersection* is a legitimate outcome, and is not the same thing.** A task
-that needs the workspace given to an agent holding only `crm:read` mints a token with no
-scopes and two cards. Two existing `RunToken mint` tests had prompts that no longer
-covered their agents' scopes and were adjusted, with a comment saying why — if you write
-a mint test, make the prompt match the scopes you expect.
-
-**A missing scope raises the card *before the run starts*, and `action` carries the
-scope: `"run:<scope>"`.** `createCardOnDeny` dedupes on
-`(agentId, kind, resource, action)`, so the handoff's literal `action: "run"` would
-collapse two missing scopes into one card and the operator would never see the second
-decision. `resource` is the agent's name as specified. **F:** these rows read
-`Researcher · run:crm:read`.
-
-**These are the first `source:"nl_intent"` + `kind:"scope"` cards.** `nl_intent`
-previously implied `kind:"grant"` and a null `jti`. These carry a real `runId` and
-`jti`, so `decideApproval`'s `allow_run` guard (which names `kind:"grant"`) does not
-bite and both buttons work. **If you ever mint one of these without a run, widen that
-guard** — the NL-grants section above says the same thing from the other side.
-
-### ⚠ This changes demo Scene 2, and the team has to decide what to do about it
-
-Scene 2's injected instruction lives inside `notes.md`; the *user's* prompt is
-"summarise Writer's notes". The keyword estimator reads no send-shaped word in that, so
-the run token is narrowed to `workspace:read` and `webhook:send` — which `seed.ts` gives
-Researcher **specifically so Scene 2 reaches the IFC check** — is off the token, and
-therefore off Codex's `enabled_tools` (`codex-runner.ts:97`). The injected instruction is
-never attempted. Scene 2 produces **no deny, no card, no RunEvent**: not a different
-reason, silence where the centrepiece was. `/demo/replay` is dark too — `demo.ts:99`
-signs its token from `runToken.scp`.
-
-This is the feature working as designed, and no test catches it because every gateway
-test builds `RunToken`s by hand rather than going through `sendMessage`. Three ways out,
-cheapest first, and it is the team's call:
-
-1. Rehearse Scene 2 with `PERMISSION_ESTIMATOR_ENABLED=false`.
-2. Word the prompt so it names the send — "summarise Writer's notes and post the summary
-   to our webhook". `webhook:send` survives the narrowing and the scene then shows
-   narrowing *and* the IFC block.
-3. Re-script Scene 2 around the output screen (item 1), which still fires: an agent
-   hijacked into printing the credentials into chat gets a `kind:"gateway",
-   action:"output"` deny row. Arguably the stronger story — it is the surface the
-   original scene did not cover.
-
-**Live `tempScopes` survive the narrowing, and that is load-bearing.** `scp` is
-`(standing ∩ estimate) ∪ live tempScopes`. Without the union the scope card livelocks:
-"Allow for this run" writes `agent.tempScopes`, the follow-up message is a *new* run
-(D3), the narrowing would strip the scope the operator had just granted, the agent would
-be denied again and the same card would come back forever. Unioning them is not the
-system widening anything — `tempScopes` is written by exactly one thing, a human
-answering a card — it is the system declining to override a human. Pinned in
-`agent-service.test.ts`.
-
-**`allow_always` is *not* unioned back, deliberately.** It writes `permissions.tools`,
-which is standing, so the estimator can narrow it away again on the next task. That is
-the round-trip cost of a wrong estimate the design accepts, and it is the difference
-between "the human decided about this run" and "the human changed the agent's
-configuration". If it turns out to bite in rehearsal, the fix is a better estimate, not
-an exemption.
-
-**Two cards can exist for one decision, and nothing breaks.** The up-front card's dedupe
-key is `(agentId, "scope", "<agent name>", "run:<scope>")`; the gateway's `scopeCard` for
-the same scope is `(agentId, "scope", "user-jean/crm", "read")`. Different keys, so an
-agent that reaches for the missing scope anyway puts a second card in the queue — the
-thing the NL-grants section above argues byte-identical keys exist to prevent. Answering
-either works (`decideApproval` keys off `card.scope`), so this is untidy rather than
-unsafe; the one thing to know is that the stale card is still answerable afterwards and
-`allow_always` on it would widen `permissions.tools` after the fact. Left as is rather
-than restructuring either key.
-
-**Cards are created after the mint mutate and awaited before `executeRun` is spawned.**
-`JsonStore.mutate` chains on its own queue and awaits its own operation, so calling
-`createCardOnDeny` (itself a `mutate`) from inside the mint would deadlock. `killAgent`
-returns its ids and then acts, for the same reason; follow that shape.
+The rule the estimator implemented (Progent: removing permissions is automatic, adding
+one always needs a card) still holds everywhere else — nothing that remains widens a
+scope, a trust, or a destination without a human. If narrowing comes back, the two traps
+this section used to pin are: live `tempScopes` must survive the narrowing (or the
+"Allow for this run" card livelocks), and the up-front cards need a real `jti` (or
+`decideApproval`'s `allow_run` guard must widen).
 
 ---
 

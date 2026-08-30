@@ -8,7 +8,6 @@ import { createCardOnDeny, decideApproval, listApprovals } from "./approvals.js"
 import { parseGrantIntent, type GrantIntent } from "./nl-grant.js";
 import { createGrant, listGrants, revokeGrant, type GrantInput } from "./grants.js";
 import { screenOutput } from "./ifc.js";
-import { keywordScopes, type ScopeEstimator } from "./scope-estimator.js";
 import { DEFAULT_PERMISSIONS, effectiveScopes, JsonStore } from "./store.js";
 import type {
   Agent,
@@ -22,10 +21,8 @@ import type {
   RunEvent,
   RunEventKind,
   RunToken,
-  Scope,
   UpdateAgentInput,
 } from "./types.js";
-import { SCOPES } from "./types.js";
 import { WorkspaceManager } from "./workspace.js";
 
 const now = () => new Date().toISOString();
@@ -63,16 +60,6 @@ export class AgentService {
       config: AppConfig,
       text: string,
     ) => Promise<GrantIntent | null> = parseGrantIntent,
-    /**
-     * What *this task* needs, so the run token can be narrowed to it. The
-     * default is the deterministic keyword grammar, not the Ark-backed
-     * estimator: every harness in the suite has Ark "configured" with a fake
-     * key, so asking Ark by default would put a real network call in the path
-     * of every test that sends a message. `index.ts` injects
-     * `makeScopeEstimator(config)` for the running server.
-     */
-    private readonly estimateTaskScopes: ScopeEstimator = async (prompt) =>
-      keywordScopes(prompt),
   ) {}
 
   async initialize(): Promise<void> {
@@ -616,16 +603,9 @@ export class AgentService {
       content: prompt,
       createdAt: timestamp,
     };
-    // What this task needs, decided from the user's message alone and *before*
-    // any tool runs, so nothing an agent later reads can influence it.
-    const estimated = await this.estimateScopes(prompt);
     // The token row and the run are written in one mutation: a run that exists
     // without an identity would be a run the gateway cannot check.
-    const {
-      agent: agentAtStart,
-      runToken,
-      missing,
-    } = await this.store.mutate((database) => {
+    const { agent: agentAtStart, runToken } = await this.store.mutate((database) => {
       const storedAgent = database.agents.find((item) => item.id === agentId);
       if (!storedAgent) {
         throw new HttpError(404, "Agent not found");
@@ -640,31 +620,7 @@ export class AgentService {
       database.messages.push(message);
       // tools ∪ live tempScopes, so an "Allow for this run" grant survives into
       // the follow-up message's run (docs/SEAMS.md).
-      const standing = effectiveScopes(storedAgent, timestamp);
-      // Narrowing is automatic and needs no human; widening never is. An empty
-      // estimate (disabled, or the estimator could not answer) means the
-      // standing set, which is exactly the behaviour before this existed.
-      // `storedAgent.permissions.tools` is never touched: the narrowing lives
-      // on the run token and dies with the run.
-      //
-      // Live `tempScopes` survive the filter. They are written by exactly one
-      // thing — a human answering "Allow for this run" — and stripping them
-      // would livelock the card: the follow-up run would drop the scope the
-      // operator had just granted, deny again, and raise the same card forever.
-      // Keeping them is the system declining to override a human, not the
-      // system widening anything.
-      const liveTempScopes = storedAgent.tempScopes
-        .filter((temp) => temp.expiresAt > timestamp)
-        .map((temp) => temp.scope);
-      const scp =
-        estimated.length > 0
-          ? [
-              ...new Set([
-                ...standing.filter((scope) => estimated.includes(scope)),
-                ...liveTempScopes,
-              ]),
-            ]
-          : standing;
+      const scp = effectiveScopes(storedAgent, timestamp);
       // Taints follow the data for as long as the model can still remember it.
       // A follow-up message is a *new* run with a new token, but the Codex
       // thread persists, so the agent is still holding what it read last turn.
@@ -709,19 +665,8 @@ export class AgentService {
       storedAgent.status = "busy";
       storedAgent.lastError = null;
       storedAgent.updatedAt = timestamp;
-      return {
-        agent: snapshot,
-        runToken: token,
-        missing: estimated.filter((scope) => !standing.includes(scope)),
-      };
+      return { agent: snapshot, runToken: token };
     });
-    // Asked before the run starts rather than after a mid-task deny, so a task
-    // that needs a scope the agent lacks costs the operator one decision
-    // instead of a failed run and a second message. `createCardOnDeny` is a
-    // `store.mutate` of its own, so it cannot be called from inside the one
-    // above, and it is awaited before `executeRun` is spawned so the card is
-    // really there before the agent starts.
-    await this.requestMissingScopes(agentAtStart, run, runToken, missing);
     const execution = this.executeRun(agentAtStart, run, runToken);
     this.activeExecutions.set(agentId, execution);
     void execution
@@ -732,63 +677,6 @@ export class AgentService {
       })
       .catch(() => undefined);
     return { run, message };
-  }
-
-  /**
-   * The estimate, or an empty array meaning "no opinion". Fails to the status
-   * quo in every direction: disabled by config, an estimator that throws, an
-   * estimator that answers with something that is not a scope. A broken
-   * estimate must never be able to break a run, and must never be able to
-   * *widen* anything either — hence the filter against `SCOPES`, since the
-   * Ark-backed estimator's answer is model output.
-   */
-  private async estimateScopes(prompt: string): Promise<Scope[]> {
-    if (!this.config.permissionEstimatorEnabled) return [];
-    try {
-      const estimated = await this.estimateTaskScopes(prompt);
-      return estimated.filter((scope) => SCOPES.includes(scope));
-    } catch {
-      return [];
-    }
-  }
-
-  /**
-   * One `scope` card per scope the task wants and the agent does not hold. The
-   * run still starts: the agent is denied if it reaches for the missing scope,
-   * which is today's behaviour, so a wrong estimate costs one round trip and
-   * nothing else. Nothing here grants anything — a human answers the card.
-   *
-   * **`action` carries the scope, and `docs/SEAMS.md` records why.**
-   * `createCardOnDeny` dedupes on `(agentId, kind, resource, action)`, so a
-   * literal `"run"` would collapse two missing scopes into one card and the
-   * operator would never see the second decision. Keying on the scope also
-   * keeps a retry of the same task from piling cards up, which is what the
-   * dedupe is for.
-   */
-  private async requestMissingScopes(
-    agent: Agent,
-    run: AgentRun,
-    runToken: RunToken,
-    missing: Scope[],
-  ): Promise<void> {
-    for (const scope of missing) {
-      await createCardOnDeny(this.store, {
-        source: "nl_intent",
-        kind: "scope",
-        agentId: agent.id,
-        ownerId: agent.ownerId,
-        // Unlike ticket 08's nl_intent cards these do name a run, so
-        // `decideApproval`'s `allow_run` guard does not bite and both buttons
-        // work (docs/SEAMS.md).
-        runId: run.id,
-        jti: runToken.jti,
-        resource: agent.name,
-        action: "run:" + scope,
-        scope,
-        grant: null,
-        reason: "this task looks like it needs " + scope + ", which this agent doesn't have",
-      });
-    }
   }
 
   async systemInfo(): Promise<Record<string, unknown>> {

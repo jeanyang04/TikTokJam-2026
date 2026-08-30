@@ -6,9 +6,8 @@ import { AgentService } from "./agent-service.js";
 import { verifyToken } from "./auth.js";
 import type { AppConfig } from "./config.js";
 import { loadConfig } from "./config.js";
-import { effectiveScopes, JsonStore } from "./store.js";
-import type { ScopeEstimator } from "./scope-estimator.js";
-import type { AgentRunner, RunnerRequest, RunnerResult, Scope } from "./types.js";
+import { JsonStore } from "./store.js";
+import type { AgentRunner, RunnerRequest, RunnerResult } from "./types.js";
 import { WorkspaceManager } from "./workspace.js";
 
 class FakeRunner implements AgentRunner {
@@ -168,9 +167,6 @@ describe("RunToken mint", () => {
       name: "Researcher",
       permissions: { tools: ["workspace:read", "crm:read"] },
     });
-    // The prompt has to cover both scopes: the default keyword estimator
-    // narrows the token to what the task needs (see "Task-scoped permissions"),
-    // so "read the notes" alone would mint workspace:read only.
     const { run } = await service.sendMessage(agent.id, "read the notes and the customer records");
 
     const tokens = store.snapshot().runTokens;
@@ -229,8 +225,6 @@ describe("RunToken mint", () => {
       name: "Researcher",
       permissions: { sandbox: "read-only", network: false, tools: ["crm:read"] },
     });
-    // A prompt the estimator reads as needing the CRM, so the narrowing leaves
-    // the agent's one scope in place and this stays a test about `permissions`.
     const { run } = await service.sendMessage(agent.id, "check the customer records");
     await expect.poll(() => service.getRun(run.id).status).toBe("completed");
 
@@ -314,149 +308,6 @@ describe("RunToken mint", () => {
     expect(tokens).toHaveLength(2);
     expect(new Set(tokens.map((token) => token.jti)).size).toBe(2);
     expect(tokens.map((token) => token.runId)).toEqual([first.run.id, second.run.id]);
-  });
-});
-
-describe("Task-scoped permissions", () => {
-  /** Same harness, plus a stubbed estimator and optional env overrides. */
-  async function withEstimator(
-    estimator: ScopeEstimator,
-    runner: AgentRunner = new FakeRunner(),
-    env: NodeJS.ProcessEnv = {},
-  ): Promise<Harness> {
-    const root = await mkdtemp(path.join(tmpdir(), "launchpad-test-"));
-    temporaryDirectories.push(root);
-    const config = loadConfig({
-      NODE_ENV: "test",
-      APP_DATA_DIR: path.join(root, "data"),
-      AGENT_WORKSPACE_ROOT: path.join(root, "workspaces"),
-      CODEX_HOME: path.join(root, "codex"),
-      ARK_API_KEY: "test-key",
-      ARK_MODEL: "ep-test",
-      ...env,
-    });
-    const store = new JsonStore(path.join(root, "data", "db.json"));
-    const service = new AgentService(
-      config,
-      store,
-      new WorkspaceManager(path.join(root, "workspaces")),
-      runner,
-      async () => null,
-      estimator,
-    );
-    await service.initialize();
-    return { service, store, config };
-  }
-
-  const ALL_FIVE: Scope[] = [
-    "workspace:read",
-    "workspace:write",
-    "crm:read",
-    "crm:write",
-    "webhook:send",
-  ];
-
-  it("narrows the RunToken to what the task needs, and leaves the agent alone", async () => {
-    const { service, store } = await withEstimator(async () => ["workspace:read"]);
-    const agent = await service.createAgent({ name: "Researcher", permissions: { tools: ALL_FIVE } });
-    const { run } = await service.sendMessage(agent.id, "summarise the notes");
-    await expect.poll(() => service.getRun(run.id).status).toBe("completed");
-
-    expect(store.snapshot().runTokens[0]?.scp).toEqual(["workspace:read"]);
-    // The narrowing is temporary and lives on the token. Standing permissions
-    // are never rewritten by it.
-    expect(service.getAgent(agent.id).permissions.tools).toEqual(ALL_FIVE);
-  });
-
-  it("reaches the runner, so the tool is off the model's menu too", async () => {
-    const runner = new CapturingRunner();
-    const { service } = await withEstimator(async () => ["workspace:read"], runner);
-    const agent = await service.createAgent({ name: "Researcher", permissions: { tools: ALL_FIVE } });
-    const { run } = await service.sendMessage(agent.id, "summarise the notes");
-    await expect.poll(() => service.getRun(run.id).status).toBe("completed");
-
-    expect(runner.request?.permissions?.tools).toEqual(["workspace:read"]);
-  });
-
-  it("raises one pending card per scope the task needs and the agent lacks", async () => {
-    const { service, store } = await withEstimator(async () => [
-      "workspace:read",
-      "crm:read",
-      "webhook:send",
-    ]);
-    const agent = await service.createAgent({
-      name: "Researcher",
-      permissions: { tools: ["workspace:read"] },
-    });
-    const { run } = await service.sendMessage(agent.id, "email the customer list out");
-
-    // Before the run completes: the human is asked up front, not after a deny.
-    const cards = store
-      .snapshot()
-      .approvals.filter((card) => card.status === "pending" && card.kind === "scope");
-    expect(cards.map((card) => card.scope).sort()).toEqual(["crm:read", "webhook:send"]);
-    expect(cards.every((card) => card.source === "nl_intent" && card.runId === run.id)).toBe(true);
-    // The narrowing itself grants nothing: the token holds only what the agent
-    // already had.
-    expect(store.snapshot().runTokens[0]?.scp).toEqual(["workspace:read"]);
-    await expect.poll(() => service.getRun(run.id).status).toBe("completed");
-  });
-
-  it("does not narrow away a scope the operator just allowed for this run", async () => {
-    // Without this the card livelocks: the follow-up run drops the scope the
-    // human granted, the agent is denied again, and the same card comes back.
-    const { service, store } = await withEstimator(async () => ["workspace:read"]);
-    const agent = await service.createAgent({
-      name: "Researcher",
-      permissions: { tools: ["workspace:read", "crm:read"] },
-    });
-    await store.mutate((database) => {
-      const stored = database.agents.find((item) => item.id === agent.id);
-      stored!.tempScopes.push({
-        scope: "crm:read",
-        expiresAt: new Date(Date.now() + 600_000).toISOString(),
-      });
-    });
-    const { run } = await service.sendMessage(agent.id, "carry on");
-    await expect.poll(() => service.getRun(run.id).status).toBe("completed");
-
-    expect(store.snapshot().runTokens[0]?.scp).toContain("crm:read");
-  });
-
-  it("falls back to the full standing set when the estimator throws", async () => {
-    const { service, store } = await withEstimator(async () => {
-      throw new Error("estimator exploded");
-    });
-    const agent = await service.createAgent({ name: "Researcher", permissions: { tools: ALL_FIVE } });
-    const { run } = await service.sendMessage(agent.id, "summarise the notes");
-    await expect.poll(() => service.getRun(run.id).status).toBe("completed");
-
-    expect(store.snapshot().runTokens[0]?.scp).toEqual(ALL_FIVE);
-    expect(store.snapshot().approvals).toHaveLength(0);
-  });
-
-  it("is byte-for-byte the old behaviour with PERMISSION_ESTIMATOR_ENABLED=false", async () => {
-    const { service, store } = await withEstimator(
-      async () => ["workspace:read"],
-      new FakeRunner(),
-      { PERMISSION_ESTIMATOR_ENABLED: "false" },
-    );
-    const agent = await service.createAgent({ name: "Researcher", permissions: { tools: ALL_FIVE } });
-    // What effectiveScopes() would answer: tools ∪ a live temp scope.
-    await store.mutate((database) => {
-      const stored = database.agents.find((item) => item.id === agent.id);
-      stored!.tempScopes.push({
-        scope: "crm:read",
-        expiresAt: new Date(Date.now() + 600_000).toISOString(),
-      });
-    });
-    const { run } = await service.sendMessage(agent.id, "summarise the notes");
-    await expect.poll(() => service.getRun(run.id).status).toBe("completed");
-
-    expect(store.snapshot().runTokens[0]?.scp).toEqual(
-      effectiveScopes(service.getAgent(agent.id)),
-    );
-    expect(store.snapshot().approvals).toHaveLength(0);
   });
 });
 

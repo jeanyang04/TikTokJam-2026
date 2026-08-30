@@ -9,9 +9,7 @@ import { createApp } from "./app.js";
 import { loadConfig, writeCodexConfig } from "./config.js";
 import { demoPlugin } from "./demo.js";
 import { loadFingerprints } from "./ifc.js";
-import { parseGrantIntent } from "./nl-grant.js";
 import { redact } from "./redact.js";
-import { makeScopeEstimator } from "./scope-estimator.js";
 import { createRunner } from "./runner-factory.js";
 import { JsonStore } from "./store.js";
 import { WorkspaceManager } from "./workspace.js";
@@ -28,18 +26,7 @@ await writeCodexConfig(config);
 const store = new JsonStore(path.join(config.dataDirectory, "launchpad.json"));
 const workspaces = new WorkspaceManager(config.workspaceRoot);
 const runner = createRunner(config);
-// The Ark-backed estimator is wired here, not defaulted in the constructor:
-// every test harness has Ark "configured" with a fake key, so the default has
-// to be the offline keyword grammar (docs/SEAMS.md). `parseGrantIntent` is
-// passed explicitly only because it sits in front of it in the signature.
-const service = new AgentService(
-  config,
-  store,
-  workspaces,
-  runner,
-  parseGrantIntent,
-  makeScopeEstimator(config),
-);
+const service = new AgentService(config, store, workspaces, runner);
 const webhookSink = new MockWebhookSink();
 await service.initialize();
 

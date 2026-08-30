@@ -39,13 +39,6 @@ const envSchema = z.object({
   // report "unavailable" rather than blocking the rest of the app.
   DATABASE_URL_ADMIN: z.string().optional(),
   DATABASE_URL_AGENT: z.string().optional(),
-  // Task-scoped permissions (scope-estimator.ts). false = mint the RunToken
-  // with the agent's full standing scopes and raise no card: byte-for-byte the
-  // behaviour before the estimator existed.
-  PERMISSION_ESTIMATOR_ENABLED: z
-    .enum(["true", "false"])
-    .default("true")
-    .transform((value) => value === "true"),
   LLM_PROXY_ENABLED: z
     .enum(["true", "false"])
     .default("false")
@@ -106,7 +99,6 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env) {
       (env.RUNTIME_PROVIDER === "container"
         ? "http://host.docker.internal:3000"
         : "http://127.0.0.1:3000"),
-    permissionEstimatorEnabled: env.PERMISSION_ESTIMATOR_ENABLED,
     llmProxyEnabled: env.LLM_PROXY_ENABLED,
     seedUsers: env.SEED_USERS,
     arkApiKey: env.ARK_API_KEY?.trim() ?? "",
