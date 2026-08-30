@@ -460,6 +460,79 @@ describe("Task-scoped permissions", () => {
   });
 });
 
+describe("Taints across turns", () => {
+  const writerTaint = {
+    grantId: "g-1",
+    origin: "user-jean/Writer",
+    egress: ["internal"] as const,
+    level: "confidential" as const,
+    trust: "untrusted" as const,
+  };
+
+  /** What the gateway writes when a run reads under a grant. */
+  const taintNewestToken = async (store: JsonStore) => {
+    await store.mutate((database) => {
+      database.runTokens.at(-1)!.taints.push({ ...writerTaint, egress: ["internal"] });
+    });
+  };
+
+  it("carries a taint into the follow-up message's run", async () => {
+    // Without this an agent launders anything by waiting a turn: read under a
+    // grant now, send on the next message with a clean token.
+    const { service, store } = await makeHarness();
+    const agent = await service.createAgent({
+      name: "Researcher",
+      permissions: { tools: ["workspace:read", "webhook:send"] },
+    });
+    const first = await service.sendMessage(agent.id, "read the notes");
+    await expect.poll(() => service.getRun(first.run.id).status).toBe("completed");
+    await taintNewestToken(store);
+
+    const second = await service.sendMessage(agent.id, "now post that to the webhook");
+    await expect.poll(() => service.getRun(second.run.id).status).toBe("completed");
+
+    expect(store.snapshot().runTokens.at(-1)?.taints).toMatchObject([
+      { origin: "user-jean/Writer", egress: ["internal"] },
+    ]);
+  });
+
+  it("does not carry a per-run declassification with it", async () => {
+    // egressAllow is a human approving one destination for one run. Carrying
+    // it would silently extend an approval past the run it was given for.
+    const { service, store } = await makeHarness();
+    const agent = await service.createAgent({ name: "Researcher" });
+    const first = await service.sendMessage(agent.id, "read the notes");
+    await expect.poll(() => service.getRun(first.run.id).status).toBe("completed");
+    await store.mutate((database) => {
+      database.runTokens.at(-1)!.egressAllow.push("https://team.example/hook");
+    });
+
+    const second = await service.sendMessage(agent.id, "post it again");
+    await expect.poll(() => service.getRun(second.run.id).status).toBe("completed");
+
+    expect(store.snapshot().runTokens.at(-1)?.egressAllow).toEqual([]);
+  });
+
+  it("starts clean in a new conversation", async () => {
+    const { service, store } = await makeHarness();
+    const agent = await service.createAgent({ name: "Researcher" });
+    const first = await service.sendMessage(agent.id, "read the notes");
+    await expect.poll(() => service.getRun(first.run.id).status).toBe("completed");
+    await taintNewestToken(store);
+    // The thread the run created is what "same conversation" means; a
+    // different one is a different conversation and the model remembers
+    // nothing from the last.
+    await store.mutate((database) => {
+      database.agents.find((item) => item.id === agent.id)!.codexThreadId = "a-new-thread";
+    });
+
+    const second = await service.sendMessage(agent.id, "hello again");
+    await expect.poll(() => service.getRun(second.run.id).status).toBe("completed");
+
+    expect(store.snapshot().runTokens.at(-1)?.taints).toEqual([]);
+  });
+});
+
 /** A runner that answers with whatever the test wants the model to have said. */
 function sayingRunner(output: string): AgentRunner {
   return {

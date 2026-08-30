@@ -65,6 +65,7 @@ describe("Scene 2 replay", () => {
         scp: ["workspace:read", "webhook:send"],
         taints: [],
         egressAllow: [],
+        threadId: null,
         issuedAt,
         expiresAt: new Date(Date.now() + 60_000).toISOString(),
         revokedAt: null,

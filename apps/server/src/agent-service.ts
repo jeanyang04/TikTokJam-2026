@@ -665,14 +665,40 @@ export class AgentService {
               ]),
             ]
           : standing;
+      // Taints follow the data for as long as the model can still remember it.
+      // A follow-up message is a *new* run with a new token, but the Codex
+      // thread persists, so the agent is still holding what it read last turn.
+      // Minting an empty taint list let it launder anything by waiting a turn:
+      // read under a grant, then send on the next message with a clean token.
+      //
+      // Not carried: `egressAllow`. That is a human approving one destination
+      // for one run, and it must not silently outlive the run they approved.
+      //
+      // This does *not* close laundering through storage — copying borrowed
+      // content into the agent's own workspace, which never taints on read,
+      // survives any run- or conversation-scoped label. Closing that needs the
+      // label on the file (docs/SEAMS.md).
+      const previousToken = database.runTokens
+        .filter((item) => item.agentId === agentId)
+        .sort((left, right) => left.issuedAt.localeCompare(right.issuedAt))
+        .at(-1);
+      // A completed run has its thread backfilled below, so null here means a
+      // run that never finished and never learned its thread. Treat that as
+      // the same conversation: failing permissive keeps a label the agent may
+      // still be holding, and failing strict would drop it.
+      const sameConversation =
+        previousToken !== undefined &&
+        (previousToken.threadId === null ||
+          previousToken.threadId === storedAgent.codexThreadId);
       const token: RunToken = {
         jti: randomUUID(),
         runId,
         agentId,
         ownerId: storedAgent.ownerId,
         scp,
-        taints: [],
+        taints: sameConversation ? structuredClone(previousToken.taints) : [],
         egressAllow: [],
+        threadId: storedAgent.codexThreadId,
         issuedAt: timestamp,
         expiresAt: new Date(Date.parse(timestamp) + this.config.codexTimeoutMs + 60_000)
           .toISOString(),
@@ -866,6 +892,15 @@ export class AgentService {
         agent.codexThreadId = result.threadId;
         agent.lastError = null;
         agent.updatedAt = completedAt;
+        // The first run of a conversation is minted before the thread exists,
+        // so its token records `threadId: null`. Backfill it with the thread
+        // the run created, or the next mint cannot tell "the conversation this
+        // started" from "some other conversation" and carries taints into a
+        // thread that remembers nothing.
+        const storedToken = database.runTokens.find((item) => item.jti === runToken.jti);
+        if (storedToken && storedToken.threadId === null) {
+          storedToken.threadId = result.threadId;
+        }
       });
       await this.closeRunToken(runToken.jti);
     } catch (error) {

@@ -93,6 +93,14 @@ export interface RunToken {
    * Rows persisted before this field default to `[]` on load.
    */
   egressAllow: string[];
+  /**
+   * The agent's Codex thread as of this mint, or null for a run that predates
+   * the thread it went on to create. Taints carry forward from the previous
+   * run only while this is the same conversation — the model's memory of what
+   * it read is what the taint is tracking. Rows persisted before this field
+   * default to null on load.
+   */
+  threadId: string | null;
   issuedAt: string;
   expiresAt: string;
   revokedAt: string | null;

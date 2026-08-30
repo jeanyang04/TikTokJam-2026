@@ -896,3 +896,48 @@ reasoning, not a green run. Worth one `npm run check:db` from someone who has Do
 **Demo consequence, and it is a good one.** An agent that reads the CRM and tries to
 post it out is now a live Scene 2 that needs no planted file at all. The card names
 `user-jean/crm` as the origin.
+
+---
+
+## Taints survive the turn (`agent-service.ts`, `types.ts`, `store.ts`)
+
+**The hole this closes, found in a live store.** Taints lived on the `RunToken`, and a
+RunToken is minted per *message*. The Codex thread persists across turns, so the agent
+still remembered what it read — but the next token was minted with `taints: []`. Read
+under a grant on one message, send on the next, no block. Observed directly:
+run `4a9e5e` read a borrowed workspace and carried `[user-jean/woof woof:internal]`;
+run `0f25fa`, the very next message, carried `[]` and its `webhook_send` was allowed.
+Within one run the machinery was always fine (`99231f` read the CRM and was denied
+`ifc` on the same turn) — the boundary was the only problem.
+
+**What it does now.** `sendMessage` carries `taints` forward from the agent's newest
+prior RunToken while the conversation is the same one.
+
+**`RunToken.threadId` is what "the same conversation" means**, set at mint from
+`agent.codexThreadId` and **backfilled on completion** with the thread the run created.
+The backfill is load-bearing and not obvious: a conversation's first run is minted
+before any thread exists, so without it that token records `null` forever and every
+later mint reads it as "same conversation" — including in a genuinely different thread
+that remembers nothing. A `null` that survives means a run that never completed, and
+that is treated as the same conversation: failing permissive keeps a label the agent may
+still hold, failing strict drops it.
+
+**`egressAllow` is deliberately NOT carried.** It is a human approving one destination
+for one run, and carrying it would silently extend that approval past the run they
+approved. Pinned in `agent-service.test.ts`.
+
+**What this does NOT close: laundering through storage.** An agent can read a borrowed
+file and `workspace_write` a copy into *its own* workspace — permitted, because that
+destination is `internal` and the taint allows `internal`. Own-workspace reads go
+through `tagSelfRead`, which never taints. So the copy is clean data, and no run-scoped
+or conversation-scoped label can see it: start a new conversation, read the copy, send
+it anywhere. **Closing that needs the label on the file** — `workspace_write` recording
+the run's taints against the written path, and `workspace_read` re-applying them. That
+is the real fix and it is not in. Two individually reasonable rules compose into the
+hole, which is why it is worth writing down rather than leaving to be rediscovered.
+
+**The output screen still resets per turn.** `screenOutput` finds provenance through
+`matchOrigin(runId, …)`, and the fingerprint index is keyed by `runId`, so a credential
+read on one turn and printed on the next is not caught. Carrying that would mean either
+copying fingerprint rows to the new run or making the index conversation-scoped —
+`ifc.ts`, not done here.

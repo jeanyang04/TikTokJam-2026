@@ -24,7 +24,7 @@ function agent(id: string, name: string, ownerId: string, tools: Scope[], root: 
   return { id, name, description: "", instructions: "", ownerId, permissions: { ...DEFAULT_PERMISSIONS, tools }, tempScopes: [], status: "ready", workspacePath: path.join(root, id), codexThreadId: null, lastError: null, createdAt: t, updatedAt: t };
 }
 function token(jti: string, agentId: string, ownerId: string, scp: Scope[]): RunToken {
-  return { jti, runId: "run-" + jti, agentId, ownerId, scp, taints: [], egressAllow: [], issuedAt: new Date().toISOString(), expiresAt: soon(), revokedAt: null };
+  return { jti, runId: "run-" + jti, agentId, ownerId, scp, taints: [], egressAllow: [], threadId: null, issuedAt: new Date().toISOString(), expiresAt: soon(), revokedAt: null };
 }
 
 let store: JsonStore; let root: string; let app: ReturnType<typeof Fastify>; let sink: string[];

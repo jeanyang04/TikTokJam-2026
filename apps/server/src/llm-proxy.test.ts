@@ -41,6 +41,7 @@ async function setup() {
       scp: [],
       taints: [],
       egressAllow: [],
+      threadId: null,
       issuedAt: new Date().toISOString(),
       expiresAt: new Date(Date.now() + 60_000).toISOString(),
       revokedAt: null,

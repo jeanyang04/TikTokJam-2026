@@ -42,6 +42,9 @@ export function migrateDatabase(raw: unknown, defaultOwner = "user-jean"): Datab
     runTokens: (parsed.runTokens ?? []).map((token) => ({
       ...token,
       egressAllow: token.egressAllow ?? [],
+      // Null reads as "same conversation" when taints carry forward, which is
+      // right for old rows: they are the newest thing that agent did.
+      threadId: token.threadId ?? null,
       // A taint written before `trust` existed defaults to "untrusted": the
       // safe direction, since the check it feeds refuses an outbound action.
       taints: (token.taints ?? []).map((taint) => ({ ...taint, trust: taint.trust ?? "untrusted" })),
