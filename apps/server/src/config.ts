@@ -34,6 +34,11 @@ const envSchema = z.object({
     .default("default"),
   JWT_SECRET: z.string().trim().min(1).default("dev-only-insecure-jwt-secret"),
   GATEWAY_URL: z.string().url().optional(),
+  // LOCK 2 (B3). Both optional: until both are set, db.ts's createDb()
+  // returns null and the gateway's withOwner stays undefined — crm_* tools
+  // report "unavailable" rather than blocking the rest of the app.
+  DATABASE_URL_ADMIN: z.string().optional(),
+  DATABASE_URL_AGENT: z.string().optional(),
   LLM_PROXY_ENABLED: z
     .enum(["true", "false"])
     .default("false")
@@ -87,6 +92,8 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env) {
     containerUser: env.CONTAINER_USER?.trim() || defaultContainerUser,
     runtimeInstanceId: env.RUNTIME_INSTANCE_ID,
     jwtSecret: env.JWT_SECRET,
+    databaseUrlAdmin: env.DATABASE_URL_ADMIN,
+    databaseUrlAgent: env.DATABASE_URL_AGENT,
     gatewayUrl:
       env.GATEWAY_URL?.replace(/\/+$/, "") ??
       (env.RUNTIME_PROVIDER === "container"

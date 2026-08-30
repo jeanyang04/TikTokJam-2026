@@ -83,6 +83,43 @@ fi
 engine="$(detect_engine)"
 log "Using $engine as the Agent Runtime engine."
 
+# Postgres (LOCK 2, B3): brought up via `docker compose`, independently of
+# which engine builds/runs the Agent Runtime containers above. Left running
+# on exit (unlike the disposable runtime containers cleaned up below) so
+# seeded demo data survives between `npm run poc` runs. If `docker compose`
+# isn't available, CRM tools degrade gracefully rather than block the
+# baseline — see gateway.ts's handling of a missing `withOwner`.
+if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
+  log "Starting Postgres (docker compose)."
+  docker compose up -d postgres
+
+  log "Waiting for Postgres to be ready."
+  postgres_ready=false
+  for _ in $(seq 1 30); do
+    # Polls the container's own healthcheck (docker-compose.yml's pg_isready
+    # check) via `docker inspect`, rather than running pg_isready through
+    # `docker compose exec` on every tick — exec allocates a fresh session
+    # each call and was unreliable in this non-interactive script context.
+    postgres_container="$(docker compose ps -q postgres 2>/dev/null)"
+    if [[ -n "$postgres_container" ]] \
+      && [[ "$(docker inspect -f '{{.State.Health.Status}}' "$postgres_container" 2>/dev/null)" == "healthy" ]]; then
+      postgres_ready=true
+      break
+    fi
+    sleep 1
+  done
+
+  if [[ "$postgres_ready" == true ]]; then
+    export DATABASE_URL_ADMIN="${DATABASE_URL_ADMIN:-postgres://app_admin:launchpad@127.0.0.1:5433/launchpad}"
+    export DATABASE_URL_AGENT="${DATABASE_URL_AGENT:-postgres://app_agent:launchpad@127.0.0.1:5433/launchpad}"
+    log "Postgres ready; DATABASE_URL_ADMIN and DATABASE_URL_AGENT exported."
+  else
+    log "Postgres did not become ready in time; CRM tools will report unavailable."
+  fi
+else
+  log "docker compose not found; skipping Postgres. CRM tools will report unavailable."
+fi
+
 if [[ ! -d node_modules ]]; then
   log "Installing application dependencies."
   npm ci

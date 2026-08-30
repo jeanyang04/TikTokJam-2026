@@ -1,15 +1,24 @@
 import path from "node:path";
 import { AgentService } from "./agent-service.js";
+import { setRedactor } from "./audit.js";
 import { verifyToken } from "./auth.js";
+import { createDb } from "./db.js";
 import { gatewayPlugin } from "./gateway.js";
 import { llmProxyPlugin } from "./llm-proxy.js";
 import { createApp } from "./app.js";
 import { loadConfig, writeCodexConfig } from "./config.js";
 import { demoPlugin } from "./demo.js";
+import { loadFingerprints } from "./ifc.js";
+import { redact } from "./redact.js";
 import { createRunner } from "./runner-factory.js";
 import { JsonStore } from "./store.js";
 import { WorkspaceManager } from "./workspace.js";
 import { MockWebhookSink } from "./webhook-sink.js";
+
+// B3's redact.ts replaces audit.ts's built-in placeholder pattern list —
+// every RunEvent audit.ts has already written or ever writes goes through
+// this from here on (docs/SEAMS.md's "Audit" section).
+setRedactor(redact);
 
 const config = loadConfig();
 await writeCodexConfig(config);
@@ -21,10 +30,18 @@ const service = new AgentService(config, store, workspaces, runner);
 const webhookSink = new MockWebhookSink();
 await service.initialize();
 
+// B3: rehydrates ifc.ts's in-memory fingerprint cache from the store, so a
+// restart mid-demo doesn't lose Scene 2's provenance data. Must run before
+// the gateway (registered below) accepts its first request.
+loadFingerprints(store);
+
 const app = await createApp(config, service);
 
-// LOCK 1. withOwner (B3, Postgres/RLS) plugs in here when it lands;
-// until then crm_* reports "unavailable". The B2 webhook sink is local-only.
+// LOCK 2 (B3): null until DATABASE_URL_ADMIN/DATABASE_URL_AGENT are both
+// set — see db.ts and .env.example. crm_* stays "unavailable" until then.
+const db = createDb(config);
+
+// LOCK 1. The B2 webhook sink is local-only.
 await app.register(gatewayPlugin, {
   store,
   workspaceRoot: config.workspaceRoot,
@@ -33,6 +50,7 @@ await app.register(gatewayPlugin, {
     if (!principal) throw new Error("invalid agent token");
     return { sub: principal.agentId, own: principal.ownerId, run: principal.runId, jti: principal.jti, scp: principal.scp };
   },
+  withOwner: db?.withOwner,
   webhookSink: webhookSink.send,
   enforce: process.env.GATEWAY_ENFORCE !== "false",
 });
@@ -44,6 +62,7 @@ if (config.llmProxyEnabled) {
 const shutdown = async (signal: string) => {
   app.log.info({ signal }, "Shutting down");
   await app.close();
+  await db?.close();
   process.exit(0);
 };
 

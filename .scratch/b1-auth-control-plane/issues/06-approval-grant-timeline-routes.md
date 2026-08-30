@@ -4,7 +4,7 @@
 
 **Blocked by:** 03 (Ownership enforcement), 04 (RunToken mint), and Zeon's `grants.ts`/`approvals.ts` logic existing (external — coordinate in chat).
 
-**Status:** ready-for-agent
+**Status:** done (commits `88f3319`, `1b637d5`, `9e01aaf`). See `docs/SEAMS.md` § Policy routes.
 
 - [ ] `GET /api/approvals` returns pending requests for the caller's own agents
 - [ ] `POST /api/approvals/:id/decide {decision: allow_run|allow_always|deny}` applies the decision: allow_run widens `RunToken.scp` (+ grant with run expiry for grant cards), allow_always writes a `PolicyGrant` + widens `Agent.permissions.tools`, deny just logs

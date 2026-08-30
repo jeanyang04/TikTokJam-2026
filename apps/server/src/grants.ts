@@ -10,8 +10,18 @@ export interface GrantInput {
   resource: Resource;
   actions: GrantAction[];
   egress?: PolicyGrant["egress"] | undefined;
+  /** Default false: borrowed content cannot trigger an outbound action. */
+  trustContent?: boolean | undefined;
   expiresAt?: string | null | undefined;
 }
+
+/**
+ * The label a CRM read carries when the owner has written no standing grant
+ * over their own CRM. Not a grant id — nothing in `policyGrants` has it — so
+ * `approvals.ts` recognises it and writes a real tenant-level grant
+ * (`fromAgent: null`) when the human answers "Always allow".
+ */
+export const OWN_CRM_LABEL = "self:crm";
 
 const now = () => new Date().toISOString();
 
@@ -38,6 +48,7 @@ export async function createGrant(store: JsonStore, input: GrantInput, byOwner: 
     resource: input.resource,
     actions: input.actions,
     egress: input.egress ?? ["internal"],
+    trustContent: input.trustContent ?? false,
     createdAt: now(),
     expiresAt: input.expiresAt ?? null,
     revokedAt: null,

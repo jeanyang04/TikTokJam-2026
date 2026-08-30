@@ -20,6 +20,21 @@ export const SCOPES: readonly Scope[] = [
 
 /** Where grant-scoped data is allowed to flow (IFC). */
 export type Egress = "internal" | "agent" | "external";
+
+/**
+ * Classification of data a run has read, ordered low → high. Compare ranks
+ * via `levelRank()` in classify.ts, never by string. `confidential` is
+ * provenance (grant-scoped reads, CRM); `secret` is content the detectors
+ * flagged (credentials-shaped) and is what the output screen withholds even
+ * from the owner's own chat.
+ */
+export type SecurityLevel = "public" | "internal" | "confidential" | "secret";
+export const SECURITY_LEVELS: readonly SecurityLevel[] = [
+  "public",
+  "internal",
+  "confidential",
+  "secret",
+];
 export type Resource = "workspace" | "crm";
 export type GrantAction = "read" | "write";
 
@@ -30,11 +45,36 @@ export interface AgentPermissions {
   tools: Scope[];
 }
 
+/**
+ * Whether content can be *believed*, as opposed to how sensitive it is. Decided
+ * by the channel the content arrived on — inside the trust boundary or not —
+ * and never by reading it: a model asked "is this trustworthy?" is reading
+ * attacker-controlled text, and the attacker can write the answer.
+ */
+export type Trust = "trusted" | "untrusted";
+
 /** Stamp on data read under a grant: where it came from, where it may go. */
 export interface Label {
-  grantId: string;
+  grantId: string; // "self" for own-resource reads the classifier flagged (no grant involved)
   origin: string; // "<ownerId>/<agentId>" or "<ownerId>/crm"
   egress: Egress[];
+  /** How sensitive the read content is. Rows persisted before this field default to "internal" on load. */
+  level: SecurityLevel;
+  /** Rows persisted before this field default to "untrusted" on load — the safe direction. */
+  trust: Trust;
+}
+
+/**
+ * IFC provenance record (Level B — names *which* grant-scoped read a piece
+ * of outbound content came from, on top of the Level A allow/deny that
+ * `taints`/`egress` already do). Shingle hashes + the label only — never
+ * the raw content — so ifc.ts's persisted index can never itself become a
+ * copy of whatever it's fingerprinting.
+ */
+export interface FingerprintEntry {
+  runId: string;
+  label: Label;
+  hashes: string[];
 }
 
 /** Store row keyed by jti. AUTHORITATIVE — enforcement reads this, not JWT claims. */
@@ -45,6 +85,22 @@ export interface RunToken {
   ownerId: string;
   scp: Scope[];
   taints: Label[];
+  /**
+   * Concrete destinations a human approved for *this run* — a webhook URL, a
+   * `"<name>/workspace"`. "Allow for this run" on a declassify card writes one
+   * of these rather than widening the whole destination class, so approving
+   * "post this to our team webhook" does not also permit an attacker's URL.
+   * Rows persisted before this field default to `[]` on load.
+   */
+  egressAllow: string[];
+  /**
+   * The agent's Codex thread as of this mint, or null for a run that predates
+   * the thread it went on to create. Taints carry forward from the previous
+   * run only while this is the same conversation — the model's memory of what
+   * it read is what the taint is tracking. Rows persisted before this field
+   * default to null on load.
+   */
+  threadId: string | null;
   issuedAt: string;
   expiresAt: string;
   revokedAt: string | null;
@@ -59,6 +115,13 @@ export interface PolicyGrant {
   resource: Resource;
   actions: GrantAction[];
   egress: Egress[];
+  /**
+   * May content read under this grant be *believed*? Default `false`: a
+   * borrowed workspace is outside the trust boundary, so what an agent reads
+   * there cannot trigger an outbound action without a human. Rows persisted
+   * before this field default to `false` on load.
+   */
+  trustContent: boolean;
   createdAt: string;
   expiresAt: string | null; // set for "Allow for this run"
   revokedAt: string | null;
@@ -172,6 +235,7 @@ export interface Database {
   policyGrants: PolicyGrant[];
   approvals: ApprovalRequest[];
   runEvents: RunEvent[];
+  fingerprints: FingerprintEntry[];
 }
 
 export interface CreateAgentInput {
