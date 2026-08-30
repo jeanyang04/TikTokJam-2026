@@ -8,11 +8,23 @@ export function checkEgress(taints: Label[], destination: Egress): Label | null 
   return taints.find((t) => !t.egress.includes(destination)) ?? null;
 }
 
+/**
+ * The integrity half (FIDES, arXiv 2505.23643): content the run cannot believe
+ * must not trigger an outbound action without a human. Payload-blind like
+ * `checkEgress` — it reads the run's taints, never the body being sent.
+ */
+export function checkIntegrity(taints: Label[]): Label | null {
+  return taints.find((t) => t.trust === "untrusted") ?? null;
+}
+
 export async function addTaint(store: JsonStore, jti: string, label: Label): Promise<void> {
   await store.mutate((d) => {
     const token = d.runTokens.find((t) => t.jti === jti);
     if (!token) return;
-    if (!token.taints.some((t) => t.grantId === label.grantId)) token.taints.push(label);
+    // Keyed on grant *and* origin: `grantId` alone collapses distinct reads
+    // into one now that non-grant labels (`"self"`) exist.
+    const key = label.grantId + "|" + label.origin;
+    if (!token.taints.some((t) => t.grantId + "|" + t.origin === key)) token.taints.push(label);
   });
 }
 
@@ -45,7 +57,14 @@ export function loadFingerprints(store: JsonStore): void {
     const list = index.get(entry.runId) ?? [];
     // Rows persisted before Label.level existed lack the field at runtime
     // (the type can't say so); they default to "internal".
-    list.push({ label: { ...entry.label, level: entry.label.level ?? "internal" }, hashes: new Set(entry.hashes) });
+    list.push({
+      label: {
+        ...entry.label,
+        level: entry.label.level ?? "internal",
+        trust: entry.label.trust ?? "untrusted",
+      },
+      hashes: new Set(entry.hashes),
+    });
     index.set(entry.runId, list);
   }
 }

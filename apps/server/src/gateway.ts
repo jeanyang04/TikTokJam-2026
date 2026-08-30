@@ -17,10 +17,10 @@ import { z } from "zod";
 import { recordEvent } from "./audit.js";
 import { createCardOnDeny } from "./approvals.js";
 import { classify } from "./classify.js";
-import { findLiveGrant } from "./grants.js";
-import { addTaint, checkEgress, fingerprint, matchOrigin } from "./ifc.js";
+import { findLiveGrant, OWN_CRM_LABEL } from "./grants.js";
+import { addTaint, checkEgress, checkIntegrity, fingerprint, matchOrigin } from "./ifc.js";
 import type { JsonStore } from "./store.js";
-import type { Agent, Egress, GrantAction, Label, Resource, RunToken, Scope, SecurityLevel } from "./types.js";
+import type { Agent, Egress, GrantAction, Label, Resource, RunToken, Scope, SecurityLevel, Trust } from "./types.js";
 
 export interface AgentClaims {
   sub: string; // agentId
@@ -131,13 +131,32 @@ export const gatewayPlugin: FastifyPluginAsync<GatewayDeps> = async (app, deps) 
   }
 
   // Step 6: IFC — may data this run holds go to this destination class.
-  function egressGate(ctx: Ctx, destination: Egress, payload: string, resource: string): void {
+  /**
+   * `outbound` is what the integrity half applies to: another agent's
+   * workspace, the tenant's CRM, an external URL. A write into the agent's
+   * *own* workspace is scratch space inside the trust boundary — nobody else
+   * sees it — and holding it back would stop a run dead the moment it read
+   * anything borrowed (Scene 5: the agent keeps working on the rest).
+   */
+  function egressGate(ctx: Ctx, destination: Egress, payload: string, resource: string, outbound = true): void {
     if (!enforce) return;
     const fresh = store.snapshot().runTokens.find((t) => t.jti === ctx.jti);
+    // A destination a human looked at and approved for this run. Scoped to the
+    // exact resource, not the class: approving the team webhook must not also
+    // open every other external URL for the rest of the run.
+    if (fresh?.egressAllow?.includes(resource)) return;
     const blocking = checkEgress(fresh?.taints ?? [], destination);
-    if (!blocking) return;
-    const origin = matchOrigin(ctx.run, payload) ?? blocking;
-    throw new Denied(403, "ifc", `content originating from ${origin.origin} (grant ${origin.grantId.slice(0, 8)}, egress ${JSON.stringify(blocking.egress)}) cannot go to ${destination} destination ${resource}`);
+    if (blocking) {
+      const origin = matchOrigin(ctx.run, payload) ?? blocking;
+      throw new Denied(403, "ifc", `content originating from ${origin.origin} (grant ${origin.grantId.slice(0, 8)}, egress ${JSON.stringify(blocking.egress)}) cannot go to ${destination} destination ${resource}`);
+    }
+    // Integrity, after confidentiality: an exfil attempt is an `ifc` deny (Scene
+    // 2's line), and this catches the case confidentiality cannot see — an agent
+    // hijacked by content it read into taking an action that leaks nothing.
+    const untrusted = outbound ? checkIntegrity(fresh?.taints ?? []) : null;
+    if (untrusted) {
+      throw new Denied(403, "integrity", `this run has read untrusted content from ${untrusted.origin}, so it cannot trigger a ${destination} action on ${resource} without a human`);
+    }
   }
 
   const jail = (agentId: string, rel: string): string => {
@@ -147,18 +166,24 @@ export const gatewayPlugin: FastifyPluginAsync<GatewayDeps> = async (app, deps) 
     return full;
   };
 
-  const labelFor = (grantId: string, target: Agent, egress: Egress[], level: SecurityLevel): Label => ({ grantId, origin: target.ownerId + "/" + target.name, egress, level });
+  const labelFor = (grantId: string, target: Agent, egress: Egress[], level: SecurityLevel, trust: Trust): Label => ({ grantId, origin: target.ownerId + "/" + target.name, egress, level, trust });
 
   /**
-   * Info tagging for reads of the agent's *own* resources. No taint (chat and
-   * tool egress toward the owner's own things stay exactly as they are) — but
-   * a secret-shaped read is fingerprinted so the output screen can catch it
-   * being printed into chat. Full egress on the label keeps checkEgress inert
-   * for it even if such a label ever reached a taint list.
+   * Info tagging for reads of the agent's own *workspace*. No taint: an agent's
+   * own scratch files are not customer data, and tainting them would stop a run
+   * the moment it read anything of its own. A secret-shaped read is still
+   * fingerprinted, so the output screen catches it being printed into chat.
+   * Full egress on the label keeps checkEgress inert for it even if such a
+   * label ever reached a taint list.
+   *
+   * CRM reads used to come through here and no longer do — see `crm_read`.
    */
   const tagSelfRead = (ctx: Ctx, origin: string, content: string, level: SecurityLevel): void => {
     if (level !== "secret") return;
-    fingerprint(store, ctx.run, { grantId: "self", origin, egress: ["internal", "agent", "external"], level }, content);
+    // `trust: "trusted"` — the agent's own workspace and its own tenant's CRM
+    // are inside the trust boundary, decided by the channel, never by reading
+    // the content.
+    fingerprint(store, ctx.run, { grantId: "self", origin, egress: ["internal", "agent", "external"], level, trust: "trusted" }, content);
   };
 
   // ---- build a per-request MCP server whose tools close over the authenticated ctx ----
@@ -171,7 +196,7 @@ export const gatewayPlugin: FastifyPluginAsync<GatewayDeps> = async (app, deps) 
         await audit(ctx, tool, resource, "allow", null, { action });
         return { content: [{ type: "text" as const, text: typeof result === "string" ? result : JSON.stringify(result) }] };
       } catch (error) {
-        if (error instanceof Denied) return deny(ctx, tool, resource, action, error.reason, error.message, error.reason === "scope" || error.reason === "no-grant" || error.reason === "ifc" ? cardOf() : null);
+        if (error instanceof Denied) return deny(ctx, tool, resource, action, error.reason, error.message, error.reason === "scope" || error.reason === "no-grant" || error.reason === "ifc" || error.reason === "integrity" ? cardOf() : null);
         await audit(ctx, tool, resource, "deny", "error", { action, error: String(error) });
         return { content: [{ type: "text" as const, text: "Tool failed: " + String(error) }], isError: true as const };
       }
@@ -184,14 +209,24 @@ export const gatewayPlugin: FastifyPluginAsync<GatewayDeps> = async (app, deps) 
       source: "live_deny", kind: "grant", agentId: ctx.sub, ownerId: ctx.ownerId, runId: ctx.run, jti: ctx.jti, resource: target.name + "/workspace", action, scope: null,
       grant: { fromOwner: target.ownerId, fromAgent: target.id, toAgent: ctx.sub, resource: "workspace", actions: [action], egress: ["internal"] }, reason: "no grant",
     });
+    /**
+     * One card kind for both halves of the label, distinguished by `reason`:
+     * `grant:<id>` = the confidentiality deny, `integrity:<id>` = the run holds
+     * content it cannot believe. `approvals.ts` reads that prefix, because the
+     * two mean different things to approve.
+     */
     const declassifyCard = (dest: Egress, resource: string): Parameters<typeof createCardOnDeny>[1] => {
       const t = store.snapshot().runTokens.find((x) => x.jti === ctx.jti);
       const blocking = checkEgress(t?.taints ?? [], dest);
-      return { source: "live_deny", kind: "declassify", agentId: ctx.sub, ownerId: ctx.ownerId, runId: ctx.run, jti: ctx.jti, resource, action: dest, scope: null, grant: null, reason: "grant:" + (blocking?.grantId ?? "") };
+      const reason = blocking
+        ? "grant:" + blocking.grantId
+        : "integrity:" + (checkIntegrity(t?.taints ?? [])?.grantId ?? "");
+      return { source: "live_deny", kind: "declassify", agentId: ctx.sub, ownerId: ctx.ownerId, runId: ctx.run, jti: ctx.jti, resource, action: dest, scope: null, grant: null, reason };
     };
-    const cardFor = (scope: Scope, resource: string, action: string, target?: Agent, grantAction?: GrantAction, dest?: Egress) => () => {
+    const cardFor = (scope: Scope, resource: string, action: string, target?: Agent, grantAction?: GrantAction, dest?: Egress, outbound = true) => () => {
       if (!ctx.token.scp.includes(scope)) return scopeCard(scope, resource, action);
-      if (dest && checkEgress(store.snapshot().runTokens.find((x) => x.jti === ctx.jti)?.taints ?? [], dest)) return declassifyCard(dest, resource);
+      const taints = store.snapshot().runTokens.find((x) => x.jti === ctx.jti)?.taints ?? [];
+      if (dest && (checkEgress(taints, dest) || (outbound && checkIntegrity(taints)))) return declassifyCard(dest, resource);
       if (target && grantAction && target.id !== ctx.sub) return grantCard(target, grantAction);
       return null;
     };
@@ -206,7 +241,9 @@ export const gatewayPlugin: FastifyPluginAsync<GatewayDeps> = async (app, deps) 
         const { target, grant } = resolveWorkspace(ctx, agent, "read");
         const text = await readFile(jail(target.id, rel), "utf8");
         if (grant) {
-          const label = labelFor(grant.id, target, grant.egress, classify("granted-workspace", text));
+          // Borrowed content: believable only if the human said so when the
+          // grant was written. Default false = untrusted.
+          const label = labelFor(grant.id, target, grant.egress, classify("granted-workspace", text), grant.trustContent ? "trusted" : "untrusted");
           await addTaint(store, ctx.jti, label);
           fingerprint(store, ctx.run, label, text);
         } else {
@@ -223,10 +260,10 @@ export const gatewayPlugin: FastifyPluginAsync<GatewayDeps> = async (app, deps) 
       const target = agentByRef(agent);
       const dest: Egress = target && target.id !== ctx.sub ? "agent" : "internal";
       const resource = (target?.name ?? agent) + "/workspace";
-      return run("workspace_write", resource, "write", cardFor("workspace:write", resource, "write", target ?? undefined, "write", dest), async () => {
+      return run("workspace_write", resource, "write", cardFor("workspace:write", resource, "write", target ?? undefined, "write", dest, dest === "agent"), async () => {
         scopeOf(ctx, "workspace_write");
         const { target } = resolveWorkspace(ctx, agent, "write");
-        egressGate(ctx, dest, body, resource);
+        egressGate(ctx, dest, body, resource, dest === "agent");
         const full = jail(target.id, rel);
         await mkdir(path.dirname(full), { recursive: true });
         await writeFile(full, body, "utf8");
@@ -246,7 +283,23 @@ export const gatewayPlugin: FastifyPluginAsync<GatewayDeps> = async (app, deps) 
           ? await q("SELECT id, owner_id, customer, note FROM crm_records WHERE customer = $1", [customer])
           : await q("SELECT id, owner_id, customer, note FROM crm_records ORDER BY customer");
         const serialized = JSON.stringify(rows.rows);
-        tagSelfRead(ctx, ctx.ownerId + "/crm", serialized, classify("crm", serialized));
+        // The owner's own CRM is still customer data. Tainting it means the run
+        // cannot post it outward, or into another agent's workspace, without a
+        // human — reading it and writing back to the CRM or to its own files is
+        // untouched, because those are `internal`. An owner who wants it to
+        // flow further says so once, as a tenant-level grant (`fromAgent: null`),
+        // which is what "Always allow" on the resulting card writes.
+        const standing = findLiveGrant(store, { fromOwner: ctx.ownerId, fromAgent: null, toAgent: ctx.sub, resource: "crm", action: "read" });
+        const label: Label = {
+          grantId: standing?.id ?? OWN_CRM_LABEL,
+          origin: ctx.ownerId + "/crm",
+          egress: standing?.egress ?? ["internal"],
+          level: classify("crm", serialized),
+          // Own tenant, inside the trust boundary: this can be believed.
+          trust: "trusted",
+        };
+        await addTaint(store, ctx.jti, label);
+        fingerprint(store, ctx.run, label, serialized);
         return rows.rows;
       });
     }));

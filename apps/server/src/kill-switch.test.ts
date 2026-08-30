@@ -21,6 +21,8 @@ async function seedToken(
     ownerId: agent.ownerId,
     scp: ["crm:read"],
     taints: [],
+    egressAllow: [],
+    threadId: null,
     issuedAt: new Date().toISOString(),
     expiresAt: new Date(Date.now() + 600_000).toISOString(),
     revokedAt: null,

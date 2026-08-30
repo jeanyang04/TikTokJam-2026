@@ -2,7 +2,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { fingerprint, loadFingerprints, matchOrigin, screenOutput } from "./ifc.js";
+import { addTaint, checkIntegrity, fingerprint, loadFingerprints, matchOrigin, screenOutput } from "./ifc.js";
 import { JsonStore } from "./store.js";
 import type { Label } from "./types.js";
 
@@ -22,7 +22,46 @@ async function tempStore(): Promise<JsonStore> {
   return store;
 }
 
-const label: Label = { grantId: "g-1", origin: "user-jean/Writer", egress: ["internal"], level: "confidential" };
+const label: Label = { grantId: "g-1", origin: "user-jean/Writer", egress: ["internal"], level: "confidential", trust: "untrusted" };
+
+describe("taints", () => {
+  it("keeps two reads from different origins apart", async () => {
+    const store = await tempStore();
+    await store.mutate((d) => {
+      d.runTokens.push({
+        jti: "t-1", runId: "run-1", agentId: "a-1", ownerId: "user-jean",
+        scp: [], taints: [], egressAllow: [],
+        issuedAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 60_000).toISOString(), revokedAt: null,
+      });
+    });
+    // "self" labels mean grantId alone is no longer a key: two distinct reads
+    // would collapse into one taint and the second origin would go unrecorded.
+    await addTaint(store, "t-1", { ...label, grantId: "self", origin: "user-jean/Researcher" });
+    await addTaint(store, "t-1", { ...label, grantId: "self", origin: "user-jean/Writer" });
+
+    expect(store.snapshot().runTokens[0]?.taints).toHaveLength(2);
+  });
+
+  it("still collapses a repeated read of the same origin", async () => {
+    const store = await tempStore();
+    await store.mutate((d) => {
+      d.runTokens.push({
+        jti: "t-2", runId: "run-2", agentId: "a-1", ownerId: "user-jean",
+        scp: [], taints: [], egressAllow: [],
+        issuedAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 60_000).toISOString(), revokedAt: null,
+      });
+    });
+    await addTaint(store, "t-2", label);
+    await addTaint(store, "t-2", label);
+
+    expect(store.snapshot().runTokens[0]?.taints).toHaveLength(1);
+  });
+
+  it("refuses an outbound action while any taint is untrusted", () => {
+    expect(checkIntegrity([{ ...label, trust: "trusted" }])).toBeNull();
+    expect(checkIntegrity([{ ...label, trust: "trusted" }, label])?.origin).toBe("user-jean/Writer");
+  });
+});
 
 describe("ifc fingerprint persistence", () => {
   it("writes hashes + label to the store, never the raw content", async () => {

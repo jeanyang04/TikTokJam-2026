@@ -1184,6 +1184,42 @@ button {
   font-size: inherit;
 }
 
+.approval-trust {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin-top: 12px;
+  color: var(--ink);
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 1.5;
+  cursor: pointer;
+}
+
+/*
+ * The bare `input` rule above sets width:100% and height:40px for text fields,
+ * which turns a checkbox into a full-width white box. Attribute selector so
+ * this wins on specificity without !important.
+ */
+.approval-trust input[type="checkbox"] {
+  width: 14px;
+  min-width: 14px;
+  height: 14px;
+  flex: none;
+  margin: 2px 0 0;
+  padding: 0;
+  border-radius: 3px;
+  accent-color: #6954d9;
+  cursor: pointer;
+}
+
+.approval-trust small {
+  display: block;
+  margin-top: 2px;
+  color: var(--muted);
+  font-weight: 400;
+}
+
 .approval-saving {
   display: flex;
   align-items: center;
