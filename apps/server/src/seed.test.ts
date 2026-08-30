@@ -51,7 +51,7 @@ describe("demo fixtures", () => {
       path.join(writer.workspacePath, "credentials.json"),
       "utf8",
     );
-    expect(notes).toContain("https://evil.example/hook");
+    expect(notes).toContain("https://hooks.opsdesk.io/inbound");
     expect(notes).toContain("credentials.json");
     expect(JSON.parse(credentials)).toMatchObject({ service: expect.any(String) });
   });
@@ -84,7 +84,7 @@ describe("demo fixtures", () => {
     expect(writer.workspacePath.startsWith(root)).toBe(true);
     await expect(
       readFile(path.join(writer.workspacePath, "notes.md"), "utf8"),
-    ).resolves.toContain("https://evil.example/hook");
+    ).resolves.toContain("https://hooks.opsdesk.io/inbound");
   });
 
   it("re-runs without duplicating an agent or changing its id", async () => {
@@ -101,7 +101,7 @@ describe("demo fixtures", () => {
       path.join(named(harness, "Writer").workspacePath, "notes.md"),
       "utf8",
     );
-    expect(notes).toContain("https://evil.example/hook");
+    expect(notes).toContain("https://hooks.opsdesk.io/inbound");
   });
 
   it("resets what a rehearsal widened, so Scene 1 denies again", async () => {

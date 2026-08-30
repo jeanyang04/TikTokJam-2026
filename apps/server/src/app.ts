@@ -1,12 +1,14 @@
 import cors from "@fastify/cors";
 import fastifyStatic from "@fastify/static";
 import Fastify, { type FastifyInstance, type FastifyRequest } from "fastify";
+import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import { registerAuth } from "./auth.js";
 import type { AppConfig } from "./config.js";
 import { HttpError } from "./errors.js";
 import { SCOPES, type AgentPermissions, type Scope } from "./types.js";
+import { listWorkspaceFiles, readWorkspaceFile } from "./workspace-files.js";
 import type { AgentService } from "./agent-service.js";
 
 const agentIdParams = z.object({ id: z.string().uuid() });
@@ -62,6 +64,14 @@ const decideBody = z.object({
 const parseGrantBody = z.object({ text: z.string().trim().min(1).max(500) });
 // `limit` belongs to the agent timeline only: a run's events are bounded by the
 // run (`docs/API.md` §Events).
+// Relative by construction: a leading `/` would make `path.resolve` ignore the
+// workspace root, so it is rejected here rather than left to the path jail.
+const workspaceFileQuery = z.object({
+  path: z.string().min(1).max(1024).refine((value) => !path.isAbsolute(value), {
+    message: "path must be relative to the workspace",
+  }),
+});
+
 const eventsQuery = z.object({ filter: z.enum(["policy", "all"]).default("policy") });
 const agentEventsQuery = eventsQuery.extend({
   limit: z.coerce.number().int().min(1).max(1000).default(200),
@@ -252,6 +262,20 @@ export async function createApp(
   app.get("/api/agents/:id/grants", async (request) => {
     const { id } = agentIdParams.parse(request.params);
     return { grants: service.getGrants(id) };
+  });
+
+  // The owner's own view of the workspace, not an agent's: the ownership
+  // preHandler above has already answered 403 + RunEvent for another tenant, so
+  // these two read the resolved agent's own directory and decide nothing.
+  app.get("/api/agents/:id/files", async (request) => {
+    const { id } = agentIdParams.parse(request.params);
+    return listWorkspaceFiles(service.getAgent(id).workspacePath);
+  });
+
+  app.get("/api/agents/:id/files/content", async (request) => {
+    const { id } = agentIdParams.parse(request.params);
+    const { path: relative } = workspaceFileQuery.parse(request.query);
+    return { file: await readWorkspaceFile(service.getAgent(id).workspacePath, relative) };
   });
 
   // Not under a guarded prefix, and it must not be: the resource being created

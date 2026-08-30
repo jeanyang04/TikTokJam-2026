@@ -43,7 +43,20 @@ export async function cleanupHarnesses(): Promise<void> {
   await Promise.all(
     temporaryDirectories
       .splice(0)
-      .map((directory) => rm(directory, { recursive: true, force: true })),
+      // Best-effort, and deliberately so. `JsonStore.persist` writes
+      // `launchpad.json.tmp` and renames it, so a run still in flight when a
+      // test ends (the kill-switch and timeline tests assert *during* a run)
+      // recreates files under `data/` while this walk deletes it, and the walk
+      // fails ENOTEMPTY. Removing a scratch directory is hygiene, not an
+      // assertion: letting that race fail an otherwise passing test is what
+      // made `npm run check` flaky. `maxRetries` wins the common case; the
+      // catch covers a write that outlasts it, leaving a directory behind in
+      // the OS temp area rather than a red suite.
+      .map((directory) =>
+        rm(directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 }).catch(
+          () => undefined,
+        ),
+      ),
   );
 }
 

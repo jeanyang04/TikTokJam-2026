@@ -18,6 +18,8 @@ import type {
   RunEvent,
   Scope,
   SystemInfo,
+  WorkspaceFile,
+  WorkspaceFileContent,
 } from "./types";
 
 const starterPrompts = [
@@ -111,12 +113,27 @@ function formatEventTime(value: string): string {
   }).format(new Date(value));
 }
 
+function formatBytes(value: number): string {
+  if (value < 1024) return value + " B";
+  if (value < 1024 * 1024) return Math.round(value / 1024) + " KB";
+  return (value / (1024 * 1024)).toFixed(1) + " MB";
+}
+
 function shortId(value: string): string {
   return value.length > 12 ? value.slice(0, 8) + "…" : value;
 }
 
 function formatEventLabel(value: string): string {
   return value.replaceAll("_", " ");
+}
+
+// "action" in event.detail is the grant-level action (read/write) the
+// gateway checked for — a different concept from the tool name already
+// shown above it (e.g. "workspace_read"). Label it distinctly so it
+// doesn't read as a duplicate of that line.
+function formatDetailKey(key: string): string {
+  if (key === "action") return "Grant action needed";
+  return formatEventLabel(key);
 }
 
 function formatDetailValue(value: unknown): string {
@@ -145,6 +162,153 @@ function StatusPill({ status }: { status: Agent["status"] }) {
 
 function Spinner() {
   return <span className="spinner" aria-label="Loading" />;
+}
+
+type FileTreeNode =
+  | { type: "folder"; name: string; path: string; children: FileTreeNode[] }
+  | { type: "file"; name: string; path: string; size: number };
+
+function buildFileTree(entries: WorkspaceFile[]): FileTreeNode[] {
+  const root: FileTreeNode[] = [];
+  const childrenByPath = new Map<string, FileTreeNode[]>([["", root]]);
+
+  const ensureFolder = (path: string): FileTreeNode[] => {
+    const existing = childrenByPath.get(path);
+    if (existing) return existing;
+    const cut = path.lastIndexOf("/");
+    const parentPath = cut >= 0 ? path.slice(0, cut) : "";
+    const name = cut >= 0 ? path.slice(cut + 1) : path;
+    const parentChildren = ensureFolder(parentPath);
+    const node: FileTreeNode = { type: "folder", name, path, children: [] };
+    parentChildren.push(node);
+    childrenByPath.set(path, node.children);
+    return node.children;
+  };
+
+  for (const file of entries) {
+    const cut = file.path.lastIndexOf("/");
+    const parentPath = cut >= 0 ? file.path.slice(0, cut) : "";
+    const name = cut >= 0 ? file.path.slice(cut + 1) : file.path;
+    ensureFolder(parentPath).push({ type: "file", name, path: file.path, size: file.size });
+  }
+
+  const sortNodes = (nodes: FileTreeNode[]) => {
+    nodes.sort((a, b) =>
+      a.type !== b.type ? (a.type === "folder" ? -1 : 1) : a.name.localeCompare(b.name),
+    );
+    for (const node of nodes) if (node.type === "folder") sortNodes(node.children);
+  };
+  sortNodes(root);
+  return root;
+}
+
+function FileTree({
+  nodes,
+  depth,
+  expanded,
+  onToggleFolder,
+  selectedPath,
+  onSelectFile,
+}: {
+  nodes: FileTreeNode[];
+  depth: number;
+  expanded: Set<string>;
+  onToggleFolder: (path: string) => void;
+  selectedPath: string | null;
+  onSelectFile: (path: string) => void;
+}) {
+  return (
+    <>
+      {nodes.map((node) =>
+        node.type === "folder" ? (
+          <div key={node.path}>
+            <button
+              className="tree-row tree-folder"
+              style={{ paddingLeft: 10 + depth * 14 }}
+              onClick={() => onToggleFolder(node.path)}
+            >
+              <span className={"tree-chevron" + (expanded.has(node.path) ? " open" : "")}>
+                ›
+              </span>
+              {node.name}
+            </button>
+            {expanded.has(node.path) && (
+              <FileTree
+                nodes={node.children}
+                depth={depth + 1}
+                expanded={expanded}
+                onToggleFolder={onToggleFolder}
+                selectedPath={selectedPath}
+                onSelectFile={onSelectFile}
+              />
+            )}
+          </div>
+        ) : (
+          <button
+            key={node.path}
+            className={"tree-row tree-file" + (selectedPath === node.path ? " selected" : "")}
+            style={{ paddingLeft: 24 + depth * 14 }}
+            aria-pressed={selectedPath === node.path}
+            onClick={() => onSelectFile(node.path)}
+          >
+            <span className="tree-file-name">{node.name}</span>
+            <span className="files-size">{formatBytes(node.size)}</span>
+          </button>
+        ),
+      )}
+    </>
+  );
+}
+
+function ApprovalCard({
+  approval,
+  agentName,
+  deciding,
+  disabled,
+  onDecide,
+}: {
+  approval: ApprovalRequest;
+  agentName: string;
+  deciding: boolean;
+  disabled: boolean;
+  onDecide: (decision: ApprovalDecision) => void;
+}) {
+  return (
+    <article className="approval-card">
+      <h3>{agentName} requests access</h3>
+      <p className="approval-summary">
+        <strong>{approval.action}</strong> → <code>{approval.resource}</code>
+      </p>
+      <p className="approval-reason">{approval.reason}</p>
+      {approval.scope && (
+        <p className="approval-detail">
+          Missing scope <code>{approval.scope}</code>
+        </p>
+      )}
+      {approval.grant && (
+        <p className="approval-detail">
+          Grant: {approval.grant.resource} · {approval.grant.actions.join(" + ")} · egress{" "}
+          {approval.grant.egress.join(", ")}
+        </p>
+      )}
+      {deciding && (
+        <div className="approval-saving">
+          <Spinner /> Saving decision…
+        </div>
+      )}
+      <div className="approval-actions">
+        <button className="button approval-deny-button" disabled={disabled} onClick={() => onDecide("deny")}>
+          Deny
+        </button>
+        <button className="button button-ghost" disabled={disabled} onClick={() => onDecide("allow_run")}>
+          Allow for this run
+        </button>
+        <button className="button button-primary" disabled={disabled} onClick={() => onDecide("allow_always")}>
+          Always allow
+        </button>
+      </div>
+    </article>
+  );
 }
 
 function PermissionChips({
@@ -324,6 +488,27 @@ export default function App() {
   const [grants, setGrants] = useState<PolicyGrant[]>([]);
   const [grantsLoading, setGrantsLoading] = useState(false);
   const [revokingGrantId, setRevokingGrantId] = useState<string | null>(null);
+  const [files, setFiles] = useState<WorkspaceFile[]>([]);
+  const [filesTruncated, setFilesTruncated] = useState(false);
+  const [filesLoading, setFilesLoading] = useState(false);
+  const [openFile, setOpenFile] = useState<WorkspaceFileContent | null>(null);
+  const [openFilePath, setOpenFilePath] = useState<string | null>(null);
+  const [fileError, setFileError] = useState<string | null>(null);
+  const [showFilesDrawer, setShowFilesDrawer] = useState(false);
+  const [activeTab, setActiveTab] = useState<"security" | "playground" | "timeline">(
+    "playground",
+  );
+  const [fileFilter, setFileFilter] = useState("");
+  const [expandedFolders, setExpandedFolders] = useState<Set<string>>(new Set());
+  const [drawerWidth, setDrawerWidth] = useState(720);
+  const [treePaneWidth, setTreePaneWidth] = useState(220);
+  const [approvalToasts, setApprovalToasts] = useState<
+    { approval: ApprovalRequest; agentName: string }[]
+  >([]);
+  const [dismissedApprovalModalIds, setDismissedApprovalModalIds] = useState<Set<string>>(
+    new Set(),
+  );
+  const knownPendingApprovalIdsRef = useRef<Set<string> | null>(null);
   const [events, setEvents] = useState<RunEvent[]>([]);
   const [eventsLoading, setEventsLoading] = useState(false);
   const [eventFilter, setEventFilter] = useState<EventFilter>("policy");
@@ -333,6 +518,9 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const [authRequired, setAuthRequired] = useState<boolean | null>(null);
   const [currentUser, setCurrentUser] = useState<LoggedInUser | null>(restoreStoredUser);
+  const [showAccountMenu, setShowAccountMenu] = useState(false);
+  const accountWrapperRef = useRef<HTMLDivElement>(null);
+  const messagesContainerRef = useRef<HTMLDivElement>(null);
   const messageEnd = useRef<HTMLDivElement>(null);
   const selectedIdRef = useRef<string | null>(null);
   const mountedRef = useRef(true);
@@ -348,11 +536,36 @@ export default function App() {
     () => agents.find((agent) => agent.id === selectedId) ?? null,
     [agents, selectedId],
   );
+  const fileTree = useMemo(() => buildFileTree(files), [files]);
+  const filteredFiles = useMemo(() => {
+    const query = fileFilter.trim().toLowerCase();
+    if (!query) return null;
+    return files.filter((file) => file.path.toLowerCase().includes(query));
+  }, [files, fileFilter]);
   const pendingApprovals = useMemo(
     () => approvals
       .filter((approval) => approval.status === "pending")
       .sort((left, right) => right.createdAt.localeCompare(left.createdAt)),
     [approvals],
+  );
+  // Scoped to the agent actually on screen — a request for a different
+  // agent must never surface here (that's what the toast is for).
+  const selectedAgentPendingApprovals = useMemo(
+    () => pendingApprovals.filter((approval) => approval.agentId === selected?.id),
+    [pendingApprovals, selected],
+  );
+  const visibleModalApprovals = useMemo(
+    () =>
+      selectedAgentPendingApprovals.filter(
+        (approval) => !dismissedApprovalModalIds.has(approval.id),
+      ),
+    [selectedAgentPendingApprovals, dismissedApprovalModalIds],
+  );
+  // Badges signal "this many need attention" — a revoked or expired grant
+  // doesn't, so counts exclude them. The list itself still shows history.
+  const activeGrantsCount = useMemo(
+    () => grants.filter((grant) => grantState(grant) === "active").length,
+    [grants],
   );
   const latestBlockedEvent = useMemo(() => {
     if (!activeRun) return null;
@@ -373,6 +586,12 @@ export default function App() {
           approval.runId === latestBlockedEvent.runId,
       ),
     [latestBlockedEvent, pendingApprovals],
+  );
+  const isProcessing = useMemo(
+    () =>
+      (activeRun != null && ["queued", "running"].includes(activeRun.status)) ||
+      selected?.status === "busy",
+    [activeRun, selected?.status],
   );
 
   const clearSession = useCallback((message: string | null = null) => {
@@ -451,6 +670,47 @@ export default function App() {
         selectedIdRef.current === agentId
       ) {
         setGrantsLoading(false);
+      }
+    }
+  }, []);
+
+  const refreshFiles = useCallback(async (agentId: string) => {
+    const sessionVersion = sessionVersionRef.current;
+    const current = () =>
+      mountedRef.current &&
+      sessionVersion === sessionVersionRef.current &&
+      selectedIdRef.current === agentId;
+    setFilesLoading(true);
+    try {
+      const result = await api.listWorkspaceFiles(agentId);
+      if (current()) {
+        setFiles(result.files);
+        setFilesTruncated(result.truncated);
+      }
+    } finally {
+      if (current()) setFilesLoading(false);
+    }
+  }, []);
+
+  // The file body is fetched on click rather than with the listing: a workspace
+  // can hold a lot of files, and only the one being looked at is worth sending.
+  const showFile = useCallback(async (agentId: string, filePath: string) => {
+    const sessionVersion = sessionVersionRef.current;
+    setOpenFilePath(filePath);
+    setOpenFile(null);
+    setFileError(null);
+    try {
+      const result = await api.readWorkspaceFile(agentId, filePath);
+      if (
+        mountedRef.current &&
+        sessionVersion === sessionVersionRef.current &&
+        selectedIdRef.current === agentId
+      ) {
+        setOpenFile(result.file);
+      }
+    } catch (reason) {
+      if (mountedRef.current && sessionVersion === sessionVersionRef.current) {
+        setFileError(reason instanceof Error ? reason.message : String(reason));
       }
     }
   }, []);
@@ -573,6 +833,58 @@ export default function App() {
     };
   }, [authRequired, currentUser, refreshApprovals]);
 
+  // Toast any newly-arrived pending approval for an agent the user isn't
+  // currently looking at — that agent's own page shows a blocking modal
+  // instead, so a toast there would be redundant. First observation each
+  // session just establishes the baseline; it doesn't toast for requests
+  // that were already pending before this tab opened. Toasts persist until
+  // the human acts on them or dismisses them — no auto-dismiss, since a
+  // stuck task shouldn't quietly disappear from view.
+  useEffect(() => {
+    const pendingIds = new Set(
+      approvals.filter((approval) => approval.status === "pending").map((approval) => approval.id),
+    );
+    const known = knownPendingApprovalIdsRef.current;
+    if (known === null) {
+      knownPendingApprovalIdsRef.current = pendingIds;
+      return;
+    }
+    const arrivals = approvals.filter(
+      (approval) =>
+        approval.status === "pending" &&
+        !known.has(approval.id) &&
+        approval.agentId !== selectedIdRef.current,
+    );
+    if (arrivals.length > 0) {
+      setApprovalToasts((current) => [
+        ...current,
+        ...arrivals.map((approval) => ({
+          approval,
+          agentName: agents.find((agent) => agent.id === approval.agentId)?.name ?? "An agent",
+        })),
+      ]);
+    }
+    knownPendingApprovalIdsRef.current = pendingIds;
+  }, [approvals, agents]);
+
+  // Toasts reflect live approval state — if a request is decided from
+  // somewhere else (the modal, another tab), drop its toast automatically.
+  useEffect(() => {
+    setApprovalToasts((current) =>
+      current.filter((toast) =>
+        approvals.some((approval) => approval.id === toast.approval.id && approval.status === "pending"),
+      ),
+    );
+  }, [approvals]);
+
+  const dismissApprovalToast = (id: string) => {
+    setApprovalToasts((current) => current.filter((toast) => toast.approval.id !== id));
+  };
+
+  const decideFromToast = (approval: ApprovalRequest, decision: ApprovalDecision) => {
+    void decideApproval(approval, decision);
+  };
+
   useEffect(() => {
     if (authRequired !== false || !currentUser || !selectedId) {
       eventRequestRef.current += 1;
@@ -603,12 +915,26 @@ export default function App() {
     setGrants([]);
     setSecurityNotice(null);
     setShowSettings(false);
+    // The open file belongs to the agent that was selected, so it goes with it
+    // rather than sitting over the next agent's workspace under its old name.
+    setFiles([]);
+    setFilesTruncated(false);
+    setOpenFile(null);
+    setOpenFilePath(null);
+    setFileError(null);
+    setShowFilesDrawer(false);
+    setFileFilter("");
+    setExpandedFolders(new Set());
     if (!selectedId) {
       setMessages([]);
       setGrantsLoading(false);
+      setFilesLoading(false);
       return;
     }
     void refreshGrants(selectedId).catch((reason) =>
+      setError(reason instanceof Error ? reason.message : String(reason)),
+    );
+    void refreshFiles(selectedId).catch((reason) =>
       setError(reason instanceof Error ? reason.message : String(reason)),
     );
     void Promise.all([refreshMessages(selectedId), api.runs(selectedId)])
@@ -625,7 +951,7 @@ export default function App() {
       .catch((reason) =>
         setError(reason instanceof Error ? reason.message : String(reason)),
       );
-  }, [refreshGrants, refreshMessages, selectedId]);
+  }, [refreshFiles, refreshGrants, refreshMessages, selectedId]);
 
   useEffect(() => {
     if (selected) {
@@ -642,8 +968,61 @@ export default function App() {
   }, [selected]);
 
   useEffect(() => {
-    messageEnd.current?.scrollIntoView({ behavior: "smooth" });
+    if (messagesContainerRef.current) {
+      messagesContainerRef.current.scrollTo({
+        top: messagesContainerRef.current.scrollHeight,
+        behavior: "smooth",
+      });
+    }
   }, [messages, activeRun]);
+
+  useEffect(() => {
+    window.scrollTo({ top: 0, left: 0, behavior: "instant" });
+  }, [selectedId]);
+
+  useEffect(() => {
+    if (!showAccountMenu) return;
+    const handleClickOutside = (event: MouseEvent) => {
+      if (
+        accountWrapperRef.current &&
+        !accountWrapperRef.current.contains(event.target as Node)
+      ) {
+        setShowAccountMenu(false);
+      }
+    };
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setShowAccountMenu(false);
+      }
+    };
+    document.addEventListener("mousedown", handleClickOutside);
+    document.addEventListener("keydown", handleKeyDown);
+    return () => {
+      document.removeEventListener("mousedown", handleClickOutside);
+      document.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [showAccountMenu]);
+
+  useEffect(() => {
+    if (!showSettings) return;
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setShowSettings(false);
+      }
+    };
+    document.addEventListener("keydown", handleKeyDown);
+    return () => {
+      document.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [showSettings]);
+
+  useEffect(() => {
+    if (!securityNotice) return;
+    const timer = setTimeout(() => {
+      setSecurityNotice(null);
+    }, 4500);
+    return () => clearTimeout(timer);
+  }, [securityNotice]);
 
   const createAgent = async (event: React.FormEvent) => {
     event.preventDefault();
@@ -689,6 +1068,26 @@ export default function App() {
         await api.stopAgent(selected.id);
       }
       await refreshAgents();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const stopProcessing = async () => {
+    if (!selected) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await api.stopAgent(selected.id);
+      pollingRunIds.current.clear();
+      setActiveRun((current) => (current ? { ...current, status: "cancelled" } : null));
+      await Promise.all([
+        refreshAgents(),
+        refreshMessages(selected.id),
+        refreshEvents(selected.id, timelineFilterRef.current),
+      ]);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
     } finally {
@@ -802,6 +1201,8 @@ export default function App() {
     }
     const sessionVersion = sessionVersionRef.current;
     const agentId = selected.id;
+    const hadActiveScopes =
+      selected.permissions.tools.length > 0 || selected.tempScopes.length > 0;
     setKillingAgent(true);
     setSecurityNotice(null);
     setError(null);
@@ -816,7 +1217,9 @@ export default function App() {
           current.map((agent) => agent.id === killed.id ? killed : agent),
         );
         setSecurityNotice(
-          killed.name + "'s active identity was revoked and its gateway tools were removed.",
+          hadActiveScopes
+            ? killed.name + "'s active identity was revoked and its gateway tools were removed."
+            : "No active scopes to revoke — " + killed.name + " already had none.",
         );
         await Promise.all([
           refreshApprovals(),
@@ -830,6 +1233,51 @@ export default function App() {
         setKillingAgent(false);
       }
     }
+  };
+
+  const toggleFolder = (path: string) => {
+    setExpandedFolders((current) => {
+      const next = new Set(current);
+      if (next.has(path)) {
+        next.delete(path);
+      } else {
+        next.add(path);
+      }
+      return next;
+    });
+  };
+
+  const resizeDrawer = (event: React.PointerEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    const startX = event.clientX;
+    const startWidth = drawerWidth;
+    const onMove = (moveEvent: PointerEvent) => {
+      const max = Math.min(1100, window.innerWidth - 120);
+      const next = startWidth - (moveEvent.clientX - startX);
+      setDrawerWidth(Math.min(max, Math.max(380, next)));
+    };
+    const onUp = () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+    };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+  };
+
+  const resizeTreePane = (event: React.PointerEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    const startX = event.clientX;
+    const startWidth = treePaneWidth;
+    const onMove = (moveEvent: PointerEvent) => {
+      const next = startWidth + (moveEvent.clientX - startX);
+      setTreePaneWidth(Math.min(drawerWidth - 260, Math.max(140, next)));
+    };
+    const onUp = () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+    };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
   };
 
   const pollRun = async (runId: string, agentId: string) => {
@@ -968,6 +1416,61 @@ export default function App() {
 
   return (
     <div className="app-shell">
+      {approvalToasts.length > 0 && (
+        <div className="approval-toast-stack" role="status" aria-live="polite">
+          {approvalToasts.map((toast) => {
+            const deciding = decidingApprovalId === toast.approval.id;
+            return (
+              <article className="approval-toast" key={toast.approval.id}>
+                <div className="approval-toast-head">
+                  <div className="approval-toast-body">
+                    <strong>{toast.agentName}</strong> requests access
+                    <p>
+                      {formatEventLabel(toast.approval.action)} → <code>{toast.approval.resource}</code>
+                    </p>
+                  </div>
+                  <button
+                    className="approval-toast-dismiss"
+                    onClick={() => dismissApprovalToast(toast.approval.id)}
+                    aria-label="Dismiss"
+                  >
+                    ×
+                  </button>
+                </div>
+                {deciding && (
+                  <div className="approval-saving">
+                    <Spinner /> Saving decision…
+                  </div>
+                )}
+                <div className="approval-toast-actions">
+                  <button
+                    className="button button-ghost"
+                    disabled={decidingApprovalId !== null}
+                    onClick={() => decideFromToast(toast.approval, "allow_run")}
+                  >
+                    Allow for this run
+                  </button>
+                  <button
+                    className="button button-primary"
+                    disabled={decidingApprovalId !== null}
+                    onClick={() => decideFromToast(toast.approval, "allow_always")}
+                  >
+                    Always allow
+                  </button>
+                  <button
+                    className="button approval-deny-button"
+                    disabled={decidingApprovalId !== null}
+                    onClick={() => decideFromToast(toast.approval, "deny")}
+                  >
+                    Deny
+                  </button>
+                </div>
+              </article>
+            );
+          })}
+        </div>
+      )}
+
       <aside className="sidebar">
         <div className="brand">
           <div className="brand-mark">A</div>
@@ -980,25 +1483,6 @@ export default function App() {
             </span>
           </div>
         </div>
-
-        {currentUser && (
-          <div className="account-card">
-            <div className="account-avatar">{currentUser.name.slice(0, 1).toUpperCase()}</div>
-            <div className="account-copy">
-              <strong>{currentUser.name}</strong>
-              <span>
-                {approvalsLoading
-                  ? "Checking requests…"
-                  : pendingApprovals.length > 0
-                    ? pendingApprovals.length + " pending request" + (pendingApprovals.length === 1 ? "" : "s")
-                    : "Signed in"}
-              </span>
-            </div>
-            <button className="account-switch" onClick={logout} title="Switch user">
-              Switch
-            </button>
-          </div>
-        )}
 
         <button
           className="button button-primary create-button"
@@ -1019,13 +1503,15 @@ export default function App() {
             <button
               className={"agent-card " + (agent.id === selectedId ? "selected" : "")}
               key={agent.id}
-              onClick={() => setSelectedId(agent.id)}
+              onClick={() => {
+                setSelectedId(agent.id);
+                window.scrollTo({ top: 0, left: 0, behavior: "smooth" });
+              }}
             >
               <div className="agent-avatar">{agent.name.slice(0, 1).toUpperCase()}</div>
               <div className="agent-card-copy">
                 <strong>{agent.name}</strong>
                 <span className="agent-description">{agent.description || "Coding Agent"}</span>
-                <PermissionChips permissions={agent.permissions} compact />
               </div>
               <span className={"mini-dot mini-" + agent.status} />
             </button>
@@ -1038,13 +1524,124 @@ export default function App() {
           )}
         </nav>
 
-        <div className="runtime-card">
-          <span className="eyebrow">Runtime</span>
-          <strong>{system?.runtime ?? "Checking…"}</strong>
-          <span>
-            {system?.arkModel ?? "Ark model not configured"}
-            {system?.containerEngine ? " · " + system.containerEngine : ""}
-          </span>
+        <div className="sidebar-footer">
+          <div className="runtime-card">
+            <span className="eyebrow">Runtime</span>
+            <strong>{system?.runtime ?? "Checking…"}</strong>
+            <span>
+              {system?.arkModel ?? "Ark model not configured"}
+              {system?.containerEngine ? " · " + system.containerEngine : ""}
+            </span>
+          </div>
+
+          {currentUser && (
+            <div className="account-wrapper" ref={accountWrapperRef}>
+              {showAccountMenu && (
+                <div className="account-dropdown-menu" role="menu" aria-label="Switch account">
+                  {/* Available Switchable Accounts */}
+                  <div className="account-dropdown-list">
+                    {demoUsers.map((user) => {
+                      const isCurrent = user.id === currentUser.id;
+                      return (
+                        <button
+                          key={user.id}
+                          className={"account-dropdown-item " + (isCurrent ? "current" : "")}
+                          disabled={busy}
+                          onClick={() => {
+                            setShowAccountMenu(false);
+                            if (!isCurrent) {
+                              void loginAs(user.id);
+                            }
+                          }}
+                          role="menuitem"
+                        >
+                          <div className="account-switch-avatar-wrap">
+                            <div className="account-avatar">{user.name.slice(0, 1).toUpperCase()}</div>
+                            {!isCurrent && (
+                              <div className="account-switch-badge">
+                                <svg
+                                  width="12"
+                                  height="12"
+                                  viewBox="0 0 24 24"
+                                  fill="none"
+                                  stroke="currentColor"
+                                  strokeWidth="2.5"
+                                  strokeLinecap="round"
+                                  strokeLinejoin="round"
+                                >
+                                  <path d="M21.5 2v6h-6M2.5 22v-6h6M2 11.5a10 10 0 0 1 18.8-4.3M22 12.5a10 10 0 0 1-18.8 4.2" />
+                                </svg>
+                              </div>
+                            )}
+                          </div>
+                          <div className="account-dropdown-item-content">
+                            <strong className="account-dropdown-item-name">{user.name}</strong>
+                          </div>
+                          {isCurrent && (
+                            <div className="account-dropdown-check">✓</div>
+                          )}
+                        </button>
+                      );
+                    })}
+                  </div>
+
+                  <div className="account-dropdown-divider" />
+
+                  <button
+                    className="account-dropdown-logout"
+                    onClick={() => {
+                      setShowAccountMenu(false);
+                      logout();
+                    }}
+                  >
+                    <svg
+                      width="14"
+                      height="14"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="2"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                    >
+                      <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" />
+                      <polyline points="16 17 21 12 16 7" />
+                      <line x1="21" y1="12" x2="9" y2="12" />
+                    </svg>
+                    <span>Log out</span>
+                  </button>
+                </div>
+              )}
+
+              <div
+                className={"account-card " + (showAccountMenu ? "active" : "")}
+                onClick={() => setShowAccountMenu((prev) => !prev)}
+              >
+                <div className="account-avatar">{currentUser.name.slice(0, 1).toUpperCase()}</div>
+                <div className="account-copy">
+                  <strong>{currentUser.name}</strong>
+                  <span>
+                    {approvalsLoading
+                      ? "Checking requests…"
+                      : pendingApprovals.length > 0
+                        ? pendingApprovals.length + " pending request" + (pendingApprovals.length === 1 ? "" : "s")
+                        : "Signed in"}
+                  </span>
+                </div>
+                <button
+                  className="account-switch"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setShowAccountMenu((prev) => !prev);
+                  }}
+                  title="Switch user"
+                  aria-expanded={showAccountMenu}
+                >
+                  Switch
+                </button>
+              </div>
+            </div>
+          )}
         </div>
       </aside>
 
@@ -1085,19 +1682,35 @@ export default function App() {
               </div>
               <div className="header-actions">
                 <button
+                  className="button button-ghost icon-button"
+                  onClick={() => setShowFilesDrawer(true)}
+                  aria-label={"Open " + selected.name + "'s workspace files"}
+                  title="Workspace files"
+                >
+                  <svg viewBox="0 0 20 20" width="15" height="15" aria-hidden="true">
+                    <path
+                      fill="currentColor"
+                      d="M4 3.5C4 2.67 4.67 2 5.5 2H11l4 4v10.5c0 .83-.67 1.5-1.5 1.5h-9A1.5 1.5 0 0 1 3 16.5v-13Zm7 .75V6.5h2.25L11 4.25Z"
+                    />
+                  </svg>
+                  {files.length > 0 && <span className="icon-badge">{files.length}</span>}
+                </button>
+                <button
                   className="button button-ghost"
                   onClick={() => setShowSettings((value) => !value)}
                   disabled={busy || selected.status === "busy"}
                 >
                   Settings
                 </button>
-                <button
-                  className="button button-ghost"
-                  onClick={toggleAgent}
-                  disabled={busy}
-                >
-                  {selected.status === "stopped" ? "Start" : "Stop"}
-                </button>
+                {selected.status === "stopped" && (
+                  <button
+                    className="button button-ghost"
+                    onClick={toggleAgent}
+                    disabled={busy}
+                  >
+                    Start
+                  </button>
+                )}
                 <button
                   className="button button-danger"
                   onClick={deleteAgent}
@@ -1108,241 +1721,306 @@ export default function App() {
               </div>
             </header>
 
-            {pendingApprovals.length > 0 && (
-              <section className="approvals-panel" aria-label="Pending access requests">
-                <div className="approvals-heading">
-                  <div>
-                    <span className="eyebrow">Human approval required</span>
-                    <h2>Access Requests</h2>
-                    <p>Denied actions stay denied until you decide. Approval applies when the agent retries.</p>
+            {visibleModalApprovals.length > 0 && (
+              <div
+                className="approval-modal-backdrop"
+                onMouseDown={() =>
+                  setDismissedApprovalModalIds((current) => {
+                    const next = new Set(current);
+                    for (const approval of visibleModalApprovals) next.add(approval.id);
+                    return next;
+                  })
+                }
+              >
+                <div
+                  className="approval-modal"
+                  role="dialog"
+                  aria-label="Access requests for this agent"
+                  onMouseDown={(event) => event.stopPropagation()}
+                >
+                  <div className="approvals-heading">
+                    <div>
+                      <h2>{selected.name} is waiting on you</h2>
+                      <p>
+                        This task stays paused until you decide. Approve, then send a follow-up
+                        message so {selected.name} can proceed.
+                      </p>
+                    </div>
+                    <button
+                      className="approval-toast-dismiss"
+                      aria-label="Dismiss"
+                      onClick={() =>
+                        setDismissedApprovalModalIds((current) => {
+                          const next = new Set(current);
+                          for (const approval of visibleModalApprovals) next.add(approval.id);
+                          return next;
+                        })
+                      }
+                    >
+                      ×
+                    </button>
                   </div>
-                  <span>{pendingApprovals.length} pending</span>
+                  <div className="approval-list">
+                    {visibleModalApprovals.map((approval) => (
+                      <ApprovalCard
+                        key={approval.id}
+                        approval={approval}
+                        agentName={selected.name}
+                        deciding={decidingApprovalId === approval.id}
+                        disabled={decidingApprovalId !== null}
+                        onDecide={(decision) => void decideApproval(approval, decision)}
+                      />
+                    ))}
+                  </div>
                 </div>
-                <div className="approval-list">
-                  {pendingApprovals.map((approval) => {
-                    const requestingAgent = agents.find(
-                      (agent) => agent.id === approval.agentId,
-                    );
-                    const deciding = decidingApprovalId === approval.id;
-                    return (
-                      <article className="approval-card" key={approval.id}>
-                        <div className="approval-badges">
-                          <span className="approval-source">
-                            {approval.source === "live_deny" ? "Live deny" : "Natural language"}
-                          </span>
-                          <span className={"approval-kind approval-kind-" + approval.kind}>
-                            {approval.kind}
-                          </span>
-                          <time dateTime={approval.createdAt}>{formatDateTime(approval.createdAt)}</time>
-                        </div>
-                        <h3>{requestingAgent?.name ?? shortId(approval.agentId)} requests access</h3>
-                        <div className="approval-request-line">
-                          <strong>{approval.action}</strong>
-                          <span>→</span>
-                          <code>{approval.resource}</code>
-                        </div>
-                        <p className="approval-reason">{approval.reason}</p>
-                        {approval.scope && (
-                          <div className="approval-detail">
-                            Missing scope <code>{approval.scope}</code>
-                          </div>
-                        )}
-                        {approval.grant && (
-                          <div className="approval-detail">
-                            Grant: {approval.grant.resource} · {approval.grant.actions.join(" + ")} · egress {approval.grant.egress.join(", ")}
-                          </div>
-                        )}
-                        {deciding && <div className="approval-saving"><Spinner /> Saving decision…</div>}
-                        <div className="approval-actions">
-                          <button
-                            className="button button-ghost"
-                            disabled={decidingApprovalId !== null}
-                            onClick={() => void decideApproval(approval, "allow_run")}
-                          >
-                            Allow for this run
-                          </button>
-                          <button
-                            className="button button-primary"
-                            disabled={decidingApprovalId !== null}
-                            onClick={() => void decideApproval(approval, "allow_always")}
-                          >
-                            Always allow
-                          </button>
-                          <button
-                            className="button approval-deny-button"
-                            disabled={decidingApprovalId !== null}
-                            onClick={() => void decideApproval(approval, "deny")}
-                          >
-                            Deny
-                          </button>
-                        </div>
-                      </article>
-                    );
-                  })}
-                </div>
-              </section>
+              </div>
             )}
 
             {showSettings && (
-              <form className="settings-panel" onSubmit={saveAgent}>
-                <div className="settings-title">
-                  <div>
-                    <span className="eyebrow">Agent configuration</span>
-                    <h2>Identity and permissions</h2>
+              <div
+                className="settings-drawer-backdrop"
+                onMouseDown={() => setShowSettings(false)}
+              >
+                <form
+                  className="settings-panel settings-drawer"
+                  onSubmit={saveAgent}
+                  onMouseDown={(event) => event.stopPropagation()}
+                >
+                  <div className="settings-title">
+                    <div>
+                      <span className="eyebrow">Agent configuration</span>
+                      <h2>Identity and permissions</h2>
+                    </div>
+                    <button
+                      type="button"
+                      className="drawer-close-button"
+                      onClick={() => setShowSettings(false)}
+                      aria-label="Close settings"
+                    >
+                      ×
+                    </button>
                   </div>
-                  <button type="button" onClick={() => setShowSettings(false)}>×</button>
-                </div>
-                <div className="form-grid">
+                  <div className="form-grid">
+                    <label>
+                      Name
+                      <input
+                        value={form.name}
+                        onChange={(event) => setForm({ ...form, name: event.target.value })}
+                        required
+                        maxLength={80}
+                      />
+                    </label>
+                    <label>
+                      Description
+                      <input
+                        value={form.description}
+                        onChange={(event) =>
+                          setForm({ ...form, description: event.target.value })
+                        }
+                        maxLength={500}
+                      />
+                    </label>
+                  </div>
                   <label>
-                    Name
-                    <input
-                      value={form.name}
-                      onChange={(event) => setForm({ ...form, name: event.target.value })}
-                      required
-                      maxLength={80}
-                    />
-                  </label>
-                  <label>
-                    Description
-                    <input
-                      value={form.description}
+                    System instructions
+                    <textarea
+                      value={form.instructions}
                       onChange={(event) =>
-                        setForm({ ...form, description: event.target.value })
+                        setForm({ ...form, instructions: event.target.value })
                       }
-                      maxLength={500}
+                      rows={5}
+                      maxLength={10_000}
                     />
                   </label>
-                </div>
-                <label>
-                  System instructions
-                  <textarea
-                    value={form.instructions}
-                    onChange={(event) =>
-                      setForm({ ...form, instructions: event.target.value })
-                    }
-                    rows={5}
-                    maxLength={10_000}
+                  <PermissionsFields
+                    idPrefix="settings"
+                    permissions={form.permissions}
+                    onChange={(permissions) => setForm({ ...form, permissions })}
                   />
-                </label>
-                <PermissionsFields
-                  idPrefix="settings"
-                  permissions={form.permissions}
-                  onChange={(permissions) => setForm({ ...form, permissions })}
-                />
-                <div className="panel-footer">
-                  <code>{selected.workspacePath}</code>
-                  <button className="button button-primary" disabled={busy}>
-                    {busy ? <Spinner /> : "Save changes"}
-                  </button>
-                </div>
-              </form>
+                  <div className="panel-footer">
+                    <code>{selected.workspacePath}</code>
+                    <button className="button button-primary" disabled={busy}>
+                      {busy ? <Spinner /> : "Save changes"}
+                    </button>
+                  </div>
+                </form>
+              </div>
             )}
 
             {securityNotice && (
-              <div className="success-banner" role="status">
-                <span>✓</span>
-                <p>{securityNotice}</p>
-                <button onClick={() => setSecurityNotice(null)} aria-label="Dismiss">×</button>
+              <div className="toast-container" role="status" aria-live="polite">
+                <div className="toast toast-success">
+                  <span className="toast-icon">✓</span>
+                  <p className="toast-message">{securityNotice}</p>
+                  <button
+                    type="button"
+                    className="toast-close"
+                    onClick={() => setSecurityNotice(null)}
+                    aria-label="Dismiss notification"
+                  >
+                    ×
+                  </button>
+                </div>
               </div>
             )}
 
-            <section className="security-panel" aria-label="Agent security controls">
-              <div className="security-card grants-card">
-                <div className="security-card-heading">
+            <div className="agent-tabs" role="tablist">
+              <button
+                role="tab"
+                aria-selected={activeTab === "playground"}
+                className={activeTab === "playground" ? "selected" : ""}
+                onClick={() => setActiveTab("playground")}
+              >
+                Playground
+              </button>
+              <button
+                role="tab"
+                aria-selected={activeTab === "security"}
+                className={activeTab === "security" ? "selected" : ""}
+                onClick={() => setActiveTab("security")}
+              >
+                Grants &amp; Kill Switch
+                {activeGrantsCount > 0 && <span className="tab-badge">{activeGrantsCount}</span>}
+              </button>
+              <button
+                role="tab"
+                aria-selected={activeTab === "timeline"}
+                className={activeTab === "timeline" ? "selected" : ""}
+                onClick={() => setActiveTab("timeline")}
+              >
+                Timeline
+              </button>
+            </div>
+
+            {activeTab === "security" && (
+              <div className="tab-scroll">
+              {selectedAgentPendingApprovals.length > 0 && (
+              <section className="approvals-panel" aria-label="Pending access requests">
+                <div className="approvals-heading">
                   <div>
-                    <span className="eyebrow">Data relationships</span>
-                    <h2>Policy grants</h2>
-                    <p>Access involving this agent. The gateway checks active grants on every call.</p>
+                    <h2>Access Requests</h2>
+                    <p>Denied actions stay denied until you decide. Approval applies when the agent retries.</p>
                   </div>
-                  <span className="security-count">{grants.length}</span>
+                  <span>{selectedAgentPendingApprovals.length} pending</span>
+                </div>
+                <div className="approval-list">
+                  {selectedAgentPendingApprovals.map((approval) => (
+                    <ApprovalCard
+                      key={approval.id}
+                      approval={approval}
+                      agentName={selected.name}
+                      deciding={decidingApprovalId === approval.id}
+                      disabled={decidingApprovalId !== null}
+                      onDecide={(decision) => void decideApproval(approval, decision)}
+                    />
+                  ))}
+                </div>
+              </section>
+              )}
+
+              <section className="security-panel" aria-label="Agent security controls">
+                <div className="security-card grants-card">
+                  <div className="security-card-heading">
+                    <div>
+                      <h2>Policy grants</h2>
+                      <p>Access involving this agent. The gateway checks active grants on every call.</p>
+                    </div>
+                    <span className="security-count">{activeGrantsCount}</span>
+                  </div>
+
+                  {grantsLoading ? (
+                    <div className="security-empty"><Spinner /> Loading grants…</div>
+                  ) : grants.length === 0 ? (
+                    <div className="security-empty">
+                      <strong>No grants yet</strong>
+                      <span>Cross-agent access approved by the owner will appear here.</span>
+                    </div>
+                  ) : (
+                    <div className="grant-list">
+                      {[...grants]
+                        .sort((left, right) => {
+                          const rank = { active: 0, expired: 1, revoked: 2 } as const;
+                          const stateDiff = rank[grantState(left)] - rank[grantState(right)];
+                          return stateDiff !== 0
+                            ? stateDiff
+                            : right.createdAt.localeCompare(left.createdAt);
+                        })
+                        .map((grant) => {
+                          const state = grantState(grant);
+                          const source = grant.fromAgent === null
+                            ? (currentUser?.name ?? "Owner") + "'s CRM"
+                            : agents.find((agent) => agent.id === grant.fromAgent)?.name ?? shortId(grant.fromAgent);
+                          const destination = agents.find((agent) => agent.id === grant.toAgent)?.name ?? shortId(grant.toAgent);
+                          return (
+                            <article className={"grant-row grant-row-" + state} key={grant.id}>
+                              <div className="grant-main">
+                                <div className="grant-direction">
+                                  <strong>{source}</strong>
+                                  <span>→</span>
+                                  <strong>{destination}</strong>
+                                </div>
+                                <div className="grant-meta">
+                                  <span>{grant.resource}</span>
+                                  <span>{grant.actions.join(" + ")}</span>
+                                  {grant.egress.map((egress) => (
+                                    <span key={egress}>egress: {egress}</span>
+                                  ))}
+                                </div>
+                                <div className="grant-lifetime">
+                                  {state === "revoked" && grant.revokedAt
+                                    ? "Revoked " + formatDateTime(grant.revokedAt)
+                                    : state === "expired" && grant.expiresAt
+                                      ? "Expired " + formatDateTime(grant.expiresAt)
+                                      : grant.expiresAt
+                                        ? "Temporary · expires " + formatDateTime(grant.expiresAt)
+                                        : "Permanent · active"}
+                                </div>
+                              </div>
+                              {state === "active" ? (
+                                <button
+                                  className="button grant-revoke-button"
+                                  disabled={revokingGrantId !== null}
+                                  onClick={() => void revokeGrant(grant)}
+                                >
+                                  {revokingGrantId === grant.id ? <Spinner /> : "Revoke"}
+                                </button>
+                              ) : (
+                                <span className={"grant-state grant-state-" + state}>{state}</span>
+                              )}
+                            </article>
+                          );
+                        })}
+                    </div>
+                  )}
                 </div>
 
-                {grantsLoading ? (
-                  <div className="security-empty"><Spinner /> Loading grants…</div>
-                ) : grants.length === 0 ? (
-                  <div className="security-empty">
-                    <strong>No grants yet</strong>
-                    <span>Cross-agent access approved by the owner will appear here.</span>
+                <div className="security-card identity-card">
+                  <div className="security-card-heading">
+                    <div>
+                      <h2>Kill switch</h2>
+                    </div>
                   </div>
-                ) : (
-                  <div className="grant-list">
-                    {[...grants]
-                      .sort((left, right) => right.createdAt.localeCompare(left.createdAt))
-                      .map((grant) => {
-                        const state = grantState(grant);
-                        const source = grant.fromAgent === null
-                          ? (currentUser?.name ?? "Owner") + "'s CRM"
-                          : agents.find((agent) => agent.id === grant.fromAgent)?.name ?? shortId(grant.fromAgent);
-                        const destination = agents.find((agent) => agent.id === grant.toAgent)?.name ?? shortId(grant.toAgent);
-                        return (
-                          <article className={"grant-row grant-row-" + state} key={grant.id}>
-                            <div className="grant-main">
-                              <div className="grant-direction">
-                                <strong>{source}</strong>
-                                <span>→</span>
-                                <strong>{destination}</strong>
-                              </div>
-                              <div className="grant-meta">
-                                <span>{grant.resource}</span>
-                                <span>{grant.actions.join(" + ")}</span>
-                                {grant.egress.map((egress) => (
-                                  <span key={egress}>egress: {egress}</span>
-                                ))}
-                              </div>
-                              <div className="grant-lifetime">
-                                {state === "revoked" && grant.revokedAt
-                                  ? "Revoked " + formatDateTime(grant.revokedAt)
-                                  : state === "expired" && grant.expiresAt
-                                    ? "Expired " + formatDateTime(grant.expiresAt)
-                                    : grant.expiresAt
-                                      ? "Temporary · expires " + formatDateTime(grant.expiresAt)
-                                      : "Permanent · active"}
-                              </div>
-                            </div>
-                            {state === "active" ? (
-                              <button
-                                className="button grant-revoke-button"
-                                disabled={revokingGrantId !== null}
-                                onClick={() => void revokeGrant(grant)}
-                              >
-                                {revokingGrantId === grant.id ? <Spinner /> : "Revoke"}
-                              </button>
-                            ) : (
-                              <span className={"grant-state grant-state-" + state}>{state}</span>
-                            )}
-                          </article>
-                        );
-                      })}
+                  <p className="identity-copy">
+                    Revoke every active run token and remove all gateway tool scopes for {selected.name}.
+                  </p>
+                  <div className="identity-scope-count">
+                    <strong>{selected.permissions.tools.length}</strong>
+                    <span>permanent gateway scope{selected.permissions.tools.length === 1 ? "" : "s"}</span>
                   </div>
-                )}
-              </div>
-
-              <div className="security-card identity-card">
-                <div className="security-card-heading">
-                  <div>
-                    <span className="eyebrow">Identity controls</span>
-                    <h2>Kill switch</h2>
-                  </div>
+                  <button
+                    className="button button-danger kill-button"
+                    disabled={killingAgent}
+                    onClick={() => void killAgentIdentity()}
+                  >
+                    {killingAgent ? <><Spinner /> Killing identity…</> : "Kill agent identity"}
+                  </button>
+                  <p className="identity-note">
+                    This does not stop Codex or change sandbox access. Use Stop to end the process.
+                  </p>
                 </div>
-                <p className="identity-copy">
-                  Revoke every active run token and remove all gateway tool scopes for {selected.name}.
-                </p>
-                <div className="identity-scope-count">
-                  <strong>{selected.permissions.tools.length}</strong>
-                  <span>permanent gateway scope{selected.permissions.tools.length === 1 ? "" : "s"}</span>
-                </div>
-                <button
-                  className="button button-danger kill-button"
-                  disabled={killingAgent}
-                  onClick={() => void killAgentIdentity()}
-                >
-                  {killingAgent ? <><Spinner /> Killing identity…</> : "Kill agent identity"}
-                </button>
-                <p className="identity-note">
-                  This does not stop Codex or change sandbox access. Use Stop to end the process.
-                </p>
+              </section>
               </div>
-            </section>
+            )}
 
             {latestBlockedEvent && (
               <aside className="policy-blocked-callout" role="alert">
@@ -1360,217 +2038,391 @@ export default function App() {
               </aside>
             )}
 
-            <section className="playground">
-              <div className="playground-topbar">
-                <div>
-                  <span className="eyebrow">Playground</span>
-                  <h2>Build something with your Agent</h2>
+            {activeTab === "playground" && (
+              <section className="playground">
+                <div className="playground-topbar">
+                  <div>
+                    <h2>Build something with your Agent</h2>
+                  </div>
+                  <div className="session-info">
+                    <span className="pulse" />
+                    {selected.codexThreadId ? "Session connected" : "New session"}
+                  </div>
                 </div>
-                <div className="session-info">
-                  <span className="pulse" />
-                  {selected.codexThreadId ? "Session connected" : "New session"}
-                </div>
-              </div>
 
-              <div className="messages">
-                {messages.length === 0 && !activeRun ? (
-                  <div className="welcome">
-                    <div className="welcome-orbit">
-                      <div>⌁</div>
+                <div className="messages" ref={messagesContainerRef}>
+                  {messages.length === 0 && !activeRun ? (
+                    <div className="welcome">
+                      <div className="welcome-orbit">
+                        <div>⌁</div>
+                      </div>
+                      <h3>What should {selected.name} build?</h3>
+                      <p>
+                        The Agent can inspect files, write code, run commands, and continue the
+                        same Codex session across messages.
+                      </p>
+                      <div className="prompt-grid">
+                        {starterPrompts.map((item) => (
+                          <button key={item} onClick={() => setPrompt(item)}>
+                            <span>↗</span>
+                            {item}
+                          </button>
+                        ))}
+                      </div>
                     </div>
-                    <h3>What should {selected.name} build?</h3>
-                    <p>
-                      The Agent can inspect files, write code, run commands, and continue the
-                      same Codex session across messages.
-                    </p>
-                    <div className="prompt-grid">
-                      {starterPrompts.map((item) => (
-                        <button key={item} onClick={() => setPrompt(item)}>
-                          <span>↗</span>
-                          {item}
-                        </button>
-                      ))}
+                  ) : (
+                    messages.map((message) => (
+                      <article className={"message message-" + message.role} key={message.id}>
+                        <div className="message-meta">
+                          <strong>{message.role === "user" ? "You" : selected.name}</strong>
+                          <span>{formatTime(message.createdAt)}</span>
+                        </div>
+                        <div className="message-body">{message.content}</div>
+                      </article>
+                    ))
+                  )}
+                  {activeRun && ["queued", "running"].includes(activeRun.status) && (
+                    <article className="message message-assistant thinking">
+                      <div className="message-meta">
+                        <strong>{selected.name}</strong>
+                        <span>working in the Agent workspace</span>
+                      </div>
+                      <div className="thinking-row">
+                        <Spinner />
+                        Codex is reading, editing, or running commands…
+                      </div>
+                    </article>
+                  )}
+                  {activeRun?.status === "failed" && (
+                    <article className="run-error">
+                      <strong>Run failed</strong>
+                      <span>{activeRun.error}</span>
+                    </article>
+                  )}
+                  <div ref={messageEnd} />
+                </div>
+
+                <form className="composer" onSubmit={sendMessage}>
+                  <textarea
+                    value={prompt}
+                    onChange={(event) => setPrompt(event.target.value)}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter" && !event.shiftKey) {
+                        if (!isProcessing) {
+                          event.preventDefault();
+                          event.currentTarget.form?.requestSubmit();
+                        }
+                      }
+                    }}
+                    placeholder={
+                      selected.status === "stopped"
+                        ? "Start this Agent to continue…"
+                        : isProcessing
+                          ? "Agent is processing…"
+                          : "Describe what you want the Agent to do…"
+                    }
+                    disabled={selected.status === "stopped" || isProcessing}
+                    rows={3}
+                  />
+                  <div className="composer-footer">
+                    <span>
+                      {isProcessing
+                        ? "Agent is processing · Click Stop to cancel"
+                        : "Enter to send · Shift + Enter for newline · " +
+                        (system?.codexSandboxMode ?? "checking sandbox")}
+                    </span>
+                    {isProcessing ? (
+                      <button
+                        type="button"
+                        className="send-button stop-button"
+                        onClick={() => void stopProcessing()}
+                        disabled={busy}
+                        aria-label="Stop processing"
+                        title="Stop processing"
+                      >
+                        <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+                          <rect x="4" y="4" width="16" height="16" rx="3" />
+                        </svg>
+                      </button>
+                    ) : (
+                      <button
+                        type="submit"
+                        className="send-button"
+                        disabled={
+                          !prompt.trim() ||
+                          selected.status === "stopped" ||
+                          busy
+                        }
+                        aria-label="Send message"
+                      >
+                        ↑
+                      </button>
+                    )}
+                  </div>
+                </form>
+              </section>
+            )}
+
+            {showFilesDrawer && (
+              <div
+                className="files-drawer-backdrop"
+                onMouseDown={() => setShowFilesDrawer(false)}
+              >
+                <section
+                  className="files-panel files-drawer"
+                  aria-label="Agent workspace files"
+                  style={{ width: drawerWidth }}
+                  onMouseDown={(event) => event.stopPropagation()}
+                >
+                  <div
+                    className="files-drawer-resize-handle"
+                    onPointerDown={resizeDrawer}
+                    aria-hidden="true"
+                  />
+
+                  <div className="timeline-heading">
+                    <div>
+                      <span className="eyebrow">Agent workspace</span>
+                      <h2>Workspace files</h2>
+                      <p>
+                        What {selected.name} has on disk. Reading here is the owner's own
+                        view — an agent still needs a scope and a grant to reach it.
+                      </p>
+                    </div>
+                    <div className="files-drawer-actions">
+                      <button
+                        className="button"
+                        onClick={() =>
+                          void refreshFiles(selected.id).catch((reason) =>
+                            setError(reason instanceof Error ? reason.message : String(reason)),
+                          )
+                        }
+                        disabled={filesLoading}
+                      >
+                        {filesLoading ? <Spinner /> : "Refresh"}
+                      </button>
+                      <button
+                        className="files-drawer-close"
+                        onClick={() => setShowFilesDrawer(false)}
+                        aria-label="Close workspace files"
+                      >
+                        ×
+                      </button>
                     </div>
                   </div>
-                ) : (
-                  messages.map((message) => (
-                    <article className={"message message-" + message.role} key={message.id}>
-                      <div className="message-meta">
-                        <strong>{message.role === "user" ? "You" : selected.name}</strong>
-                        <span>{formatTime(message.createdAt)}</span>
+
+                  {filesLoading && files.length === 0 ? (
+                    <div className="timeline-empty"><Spinner /> Reading workspace…</div>
+                  ) : files.length === 0 ? (
+                    <div className="timeline-empty">
+                      <strong>This workspace is empty</strong>
+                      <span>Files the agent creates or edits will appear here.</span>
+                    </div>
+                  ) : (
+                    <div
+                      className="files-body"
+                      style={{ gridTemplateColumns: treePaneWidth + "px 6px 1fr" }}
+                    >
+                      <div className="files-tree-pane">
+                        <div className="files-filter">
+                          <input
+                            type="text"
+                            placeholder="Filter files…"
+                            value={fileFilter}
+                            onChange={(event) => setFileFilter(event.target.value)}
+                          />
+                        </div>
+                        <div className="files-tree-scroll">
+                          {filteredFiles ? (
+                            filteredFiles.length === 0 ? (
+                              <div className="files-tree-empty">
+                                No files match "{fileFilter}"
+                              </div>
+                            ) : (
+                              filteredFiles.map((file) => (
+                                <button
+                                  key={file.path}
+                                  className={
+                                    "tree-row tree-file" +
+                                    (openFilePath === file.path ? " selected" : "")
+                                  }
+                                  style={{ paddingLeft: 12, paddingRight: 12 }}
+                                  aria-pressed={openFilePath === file.path}
+                                  onClick={() => void showFile(selected.id, file.path)}
+                                >
+                                  <span className="tree-file-name">{file.path}</span>
+                                  <span className="files-size">{formatBytes(file.size)}</span>
+                                </button>
+                              ))
+                            )
+                          ) : (
+                            <FileTree
+                              nodes={fileTree}
+                              depth={0}
+                              expanded={expandedFolders}
+                              onToggleFolder={toggleFolder}
+                              selectedPath={openFilePath}
+                              onSelectFile={(path) => void showFile(selected.id, path)}
+                            />
+                          )}
+                        </div>
                       </div>
-                      <div className="message-body">{message.content}</div>
-                    </article>
-                  ))
-                )}
-                {activeRun && ["queued", "running"].includes(activeRun.status) && (
-                  <article className="message message-assistant thinking">
-                    <div className="message-meta">
-                      <strong>{selected.name}</strong>
-                      <span>working in the Agent workspace</span>
-                    </div>
-                    <div className="thinking-row">
-                      <Spinner />
-                      Codex is reading, editing, or running commands…
-                    </div>
-                  </article>
-                )}
-                {activeRun?.status === "failed" && (
-                  <article className="run-error">
-                    <strong>Run failed</strong>
-                    <span>{activeRun.error}</span>
-                  </article>
-                )}
-                <div ref={messageEnd} />
-              </div>
 
-              <form className="composer" onSubmit={sendMessage}>
-                <textarea
-                  value={prompt}
-                  onChange={(event) => setPrompt(event.target.value)}
-                  onKeyDown={(event) => {
-                    if (event.key === "Enter" && !event.shiftKey) {
-                      event.preventDefault();
-                      event.currentTarget.form?.requestSubmit();
-                    }
-                  }}
-                  placeholder={
-                    selected.status === "stopped"
-                      ? "Start this Agent to continue…"
-                      : "Describe what you want the Agent to do…"
-                  }
-                  disabled={
-                    selected.status === "stopped" ||
-                    selected.status === "busy" ||
-                    activeRun != null && ["queued", "running"].includes(activeRun.status)
-                  }
-                  rows={3}
-                />
-                <div className="composer-footer">
-                  <span>
-                    Enter to send · Shift + Enter for newline · {system?.codexSandboxMode ?? "checking sandbox"}
-                  </span>
-                  <button
-                    className="send-button"
-                    disabled={
-                      !prompt.trim() ||
-                      selected.status === "stopped" ||
-                      selected.status === "busy" ||
-                      (activeRun != null && ["queued", "running"].includes(activeRun.status))
-                    }
-                    aria-label="Send message"
-                  >
-                    ↑
-                  </button>
-                </div>
-              </form>
-            </section>
+                      <div
+                        className="files-resize-handle"
+                        onPointerDown={resizeTreePane}
+                        aria-hidden="true"
+                      />
 
-            <section className="timeline-panel" aria-label="Agent audit timeline">
-              <div className="timeline-heading">
-                <div>
-                  <span className="eyebrow">Backend evidence</span>
-                  <h2>Audit timeline</h2>
-                  <p>Human → agent → action → resource → outcome. Event details are redacted by the server.</p>
-                </div>
-                <div className="timeline-filters" aria-label="Timeline filter">
-                  <button
-                    className={eventFilter === "policy" ? "selected" : ""}
-                    aria-pressed={eventFilter === "policy"}
-                    onClick={() => setEventFilter("policy")}
-                  >
-                    Policy only
-                  </button>
-                  <button
-                    className={eventFilter === "all" ? "selected" : ""}
-                    aria-pressed={eventFilter === "all"}
-                    onClick={() => setEventFilter("all")}
-                  >
-                    All activity
-                  </button>
-                </div>
-              </div>
-
-              {eventsLoading ? (
-                <div className="timeline-empty"><Spinner /> Loading audit events…</div>
-              ) : events.length === 0 ? (
-                <div className="timeline-empty">
-                  <strong>No {eventFilter === "policy" ? "policy" : "activity"} events yet</strong>
-                  <span>Gateway decisions, approvals, grants, and runtime telemetry will appear here.</span>
-                </div>
-              ) : (
-                <ol className="timeline-list">
-                  {events.map((event) => {
-                    const eventAgent = agents.find((agent) => agent.id === event.agentId);
-                    const owner = event.ownerId === currentUser?.id
-                      ? currentUser.name
-                      : event.ownerId;
-                    const detailEntries = Object.entries(event.detail);
-                    const origin = typeof event.detail.origin === "string"
-                      ? event.detail.origin
-                      : null;
-                    const grantId = typeof event.detail.grantId === "string"
-                      ? event.detail.grantId
-                      : null;
-                    return (
-                      <li
-                        className={
-                          "timeline-row timeline-row-" + (event.decision ?? "neutral")
-                        }
-                        key={event.id}
-                      >
-                        <time dateTime={event.at}>{formatEventTime(event.at)}</time>
-                        <div className="timeline-marker" aria-hidden="true" />
-                        <article>
-                          <div className="timeline-row-heading">
-                            <span className={"timeline-kind timeline-kind-" + event.kind}>
-                              {formatEventLabel(event.kind)}
-                            </span>
-                            <span className={"timeline-outcome timeline-outcome-" + (event.decision ?? "neutral")}>
-                              {event.decision ?? "recorded"}
-                            </span>
-                          </div>
-                          <div className="timeline-actor">
-                            <strong>{owner}</strong>
-                            <span>→</span>
-                            <strong>{eventAgent?.name ?? shortId(event.agentId)}</strong>
-                          </div>
-                          <div className="timeline-action">
-                            <code>{event.action}</code>
-                            <span>→</span>
-                            <code>{event.resource}</code>
-                          </div>
-                          {event.reason && (
-                            <p className="timeline-reason">Reason: {event.reason}</p>
-                          )}
-                          {event.reason === "ifc" && (
-                            <div className="timeline-ifc">
-                              <strong>Blocked external egress</strong>
-                              {origin && <span>Content originated from: {origin}</span>}
-                              {grantId && <span>Grant: {shortId(grantId)}</span>}
-                              <span>Destination: {event.resource}</span>
+                      <div className="files-viewer">
+                        {fileError ? (
+                          <div className="files-placeholder">{fileError}</div>
+                        ) : !openFilePath ? (
+                          <div className="files-placeholder">Select a file to read it.</div>
+                        ) : !openFile ? (
+                          <div className="files-placeholder"><Spinner /> Loading…</div>
+                        ) : (
+                          <>
+                            <div className="files-viewer-heading">
+                              <code>{openFile.path}</code>
+                              <span>{formatBytes(openFile.size)}</span>
                             </div>
-                          )}
-                          {detailEntries.length > 0 && (
-                            <details className="timeline-details">
-                              <summary>Redacted event details</summary>
-                              <dl>
-                                {detailEntries.map(([key, value]) => (
-                                  <div key={key}>
-                                    <dt>{formatEventLabel(key)}</dt>
-                                    <dd>{formatDetailValue(value)}</dd>
-                                  </div>
-                                ))}
-                              </dl>
-                            </details>
-                          )}
-                        </article>
-                      </li>
-                    );
-                  })}
-                </ol>
-              )}
-            </section>
+                            {openFile.binary ? (
+                              <div className="files-placeholder">
+                                Binary file — not shown.
+                              </div>
+                            ) : (
+                              <pre>{openFile.content}</pre>
+                            )}
+                            {openFile.truncated && (
+                              <p className="files-note">
+                                Truncated — showing the first 256 KB of this file.
+                              </p>
+                            )}
+                          </>
+                        )}
+                      </div>
+                    </div>
+                  )}
+
+                  {filesTruncated && (
+                    <p className="files-note">
+                      Listing truncated at 500 files. `.git`, `node_modules`, `dist` and
+                      `.codex` are never listed.
+                    </p>
+                  )}
+                </section>
+              </div>
+            )}
+
+            {activeTab === "timeline" && (
+              <section className="timeline-panel" aria-label="Agent audit timeline">
+                <div className="timeline-heading">
+                  <div>
+                    <h2>Audit timeline</h2>
+                    <p>Human → agent → action → resource → outcome. Event details are redacted by the server.</p>
+                  </div>
+                  <div className="timeline-filters" aria-label="Timeline filter">
+                    <button
+                      className={eventFilter === "policy" ? "selected" : ""}
+                      aria-pressed={eventFilter === "policy"}
+                      onClick={() => setEventFilter("policy")}
+                    >
+                      Policy only
+                    </button>
+                    <button
+                      className={eventFilter === "all" ? "selected" : ""}
+                      aria-pressed={eventFilter === "all"}
+                      onClick={() => setEventFilter("all")}
+                    >
+                      All activity
+                    </button>
+                  </div>
+                </div>
+
+                {eventsLoading ? (
+                  <div className="timeline-empty"><Spinner /> Loading audit events…</div>
+                ) : events.length === 0 ? (
+                  <div className="timeline-empty">
+                    <strong>No {eventFilter === "policy" ? "policy" : "activity"} events yet</strong>
+                    <span>Gateway decisions, approvals, grants, and runtime telemetry will appear here.</span>
+                  </div>
+                ) : (
+                  <ol className="timeline-list">
+                    {events.map((event) => {
+                      const eventAgent = agents.find((agent) => agent.id === event.agentId);
+                      const owner = event.ownerId === currentUser?.id
+                        ? currentUser.name
+                        : event.ownerId;
+                      const detailEntries = Object.entries(event.detail);
+                      const origin = typeof event.detail.origin === "string"
+                        ? event.detail.origin
+                        : null;
+                      const grantId = typeof event.detail.grantId === "string"
+                        ? event.detail.grantId
+                        : null;
+                      return (
+                        <li
+                          className={
+                            "timeline-row timeline-row-" + (event.decision ?? "neutral")
+                          }
+                          key={event.id}
+                        >
+                          <time dateTime={event.at}>{formatEventTime(event.at)}</time>
+                          <div className="timeline-marker" aria-hidden="true" />
+                          <article className={detailEntries.length > 0 ? "has-details" : ""}>
+                            <div className="timeline-main">
+                              <div className="timeline-row-heading">
+                                <span className={"timeline-kind timeline-kind-" + event.kind}>
+                                  {formatEventLabel(event.kind)}
+                                </span>
+                                <span className={"timeline-outcome timeline-outcome-" + (event.decision ?? "neutral")}>
+                                  {event.decision ?? "recorded"}
+                                </span>
+                              </div>
+                              <div className="timeline-actor">
+                                <strong>{owner}</strong>
+                                <span>→</span>
+                                <strong>{eventAgent?.name ?? shortId(event.agentId)}</strong>
+                              </div>
+                              <div className="timeline-action">
+                                <code>{event.action}</code>
+                                <span>→</span>
+                                <code>{event.resource}</code>
+                              </div>
+                              {event.reason && (
+                                <p className="timeline-reason">Reason: {event.reason}</p>
+                              )}
+                              {event.reason === "ifc" && (
+                                <div className="timeline-ifc">
+                                  <strong>Blocked external egress</strong>
+                                  {origin && <span>Content originated from: {origin}</span>}
+                                  {grantId && <span>Grant: {shortId(grantId)}</span>}
+                                  <span>Destination: {event.resource}</span>
+                                </div>
+                              )}
+                            </div>
+                            {detailEntries.length > 0 && (
+                              <div className="timeline-details">
+                                <span className="timeline-details-label">Redacted event details</span>
+                                <dl>
+                                  {detailEntries.map(([key, value]) => (
+                                    <div key={key}>
+                                      <dt>{formatDetailKey(key)}</dt>
+                                      <dd>{formatDetailValue(value)}</dd>
+                                    </div>
+                                  ))}
+                                </dl>
+                              </div>
+                            )}
+                          </article>
+                        </li>
+                      );
+                    })}
+                  </ol>
+                )}
+              </section>
+            )}
           </>
         ) : (
           <div className="no-agent">

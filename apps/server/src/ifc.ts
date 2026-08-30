@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
+import { detectLevel, levelRank, maxLevel, scrubSecrets } from "./classify.js";
 import type { JsonStore } from "./store.js";
-import type { Egress, Label } from "./types.js";
+import type { Egress, Label, SecurityLevel } from "./types.js";
 
 /** Level A (sound): every taint the run holds must permit the destination class. */
 export function checkEgress(taints: Label[], destination: Egress): Label | null {
@@ -42,7 +43,9 @@ export function loadFingerprints(store: JsonStore): void {
   index.clear();
   for (const entry of store.snapshot().fingerprints) {
     const list = index.get(entry.runId) ?? [];
-    list.push({ label: entry.label, hashes: new Set(entry.hashes) });
+    // Rows persisted before Label.level existed lack the field at runtime
+    // (the type can't say so); they default to "internal".
+    list.push({ label: { ...entry.label, level: entry.label.level ?? "internal" }, hashes: new Set(entry.hashes) });
     index.set(entry.runId, list);
   }
 }
@@ -68,8 +71,71 @@ export function matchOrigin(runId: string, payload: string): Label | null {
   const list = index.get(runId);
   if (!list) return null;
   const probe = shingles(payload);
-  for (const entry of list) if (probe.some((h) => entry.hashes.has(h))) return entry.label;
-  return null;
+  // Highest-level match wins, so the output screen (and a deny message) names
+  // the most sensitive origin when several reads left prints in the payload.
+  let best: Label | null = null;
+  for (const entry of list) {
+    if (!probe.some((h) => entry.hashes.has(h))) continue;
+    if (!best || levelRank(entry.label.level) > levelRank(best.level)) best = entry.label;
+  }
+  return best;
+}
+
+// ---- Output screen: chat output is the third egress surface ----
+// Tool calls are gated by checkEgress above; the run's *final output* becomes
+// a stored chat message and was previously never checked, so a prompt-injected
+// agent could simply print what it may not send. `screenOutput` runs after the
+// Codex output lands (agent-service.ts's executeRun) and before it persists.
+
+export interface ScreenResult {
+  verdict: "allow" | "redact" | "block";
+  /** Highest level of evidence found in the output. */
+  level: SecurityLevel;
+  /** The classified read the output copies through, when that is the trigger. */
+  origin: Label | null;
+  /** What to persist as the run output / assistant message. */
+  output: string;
+}
+
+/**
+ * Synchronous on the fingerprint hot cache, like matchOrigin — the caller
+ * writes the RunEvent. `outputMaxLevel` is the highest level allowed through
+ * untouched; the default lets confidential (grant-scoped provenance the owner
+ * already approved) reach the owner's chat while secrets never do.
+ *
+ * Copied-through classified content blocks the whole output (it may be
+ * paraphrased around the matched windows, so partial removal can't be
+ * trusted); a bare detector hit is scrubbed in place and the rest kept.
+ */
+export function screenOutput(
+  runId: string,
+  output: string,
+  outputMaxLevel: SecurityLevel = "confidential",
+): ScreenResult {
+  const origin = matchOrigin(runId, output);
+  const originLevel: SecurityLevel = origin?.level ?? "public";
+  const level = maxLevel(originLevel, detectLevel(output));
+  if (levelRank(level) <= levelRank(outputMaxLevel)) {
+    return { verdict: "allow", level, origin: null, output };
+  }
+  if (origin && levelRank(originLevel) > levelRank(outputMaxLevel)) {
+    return {
+      verdict: "block",
+      level,
+      origin,
+      output:
+        `DENIED (classification): output withheld — it carries content originating from ${origin.origin}` +
+        ` classified ${originLevel}, above the chat output limit (${outputMaxLevel}).` +
+        " The audit timeline has the details.",
+    };
+  }
+  const { output: scrubbed, hits } = scrubSecrets(output);
+  return {
+    verdict: "redact",
+    level,
+    origin,
+    output: scrubbed + `\n\n[launchpad] ${hits} secret-level value(s) redacted from this output.`,
+  };
 }
 
 export function clearFingerprints(store: JsonStore, runId: string): void {
