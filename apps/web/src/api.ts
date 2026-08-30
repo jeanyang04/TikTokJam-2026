@@ -134,10 +134,10 @@ export const api = {
       method: "POST",
     }),
   listApprovals: () => request<{ approvals: ApprovalRequest[] }>("/api/approvals"),
-  decideApproval: (id: string, decision: ApprovalDecision) =>
+  decideApproval: (id: string, decision: ApprovalDecision, trustContent = false) =>
     request<{ approval: ApprovalRequest }>("/api/approvals/" + id + "/decide", {
       method: "POST",
-      body: JSON.stringify({ decision }),
+      body: JSON.stringify({ decision, trustContent }),
     }),
   messages: (id: string) =>
     request<{ messages: Message[] }>("/api/agents/" + id + "/messages"),

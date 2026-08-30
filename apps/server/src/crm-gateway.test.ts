@@ -60,6 +60,7 @@ function token(jti: string, agentId: string, ownerId: string, scp: Scope[]): Run
     ownerId,
     scp,
     taints: [],
+    egressAllow: [],
     issuedAt: new Date().toISOString(),
     expiresAt: soon(),
     revokedAt: null,

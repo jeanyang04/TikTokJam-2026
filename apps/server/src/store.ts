@@ -36,6 +36,22 @@ export function migrateDatabase(raw: unknown, defaultOwner = "user-jean"): Datab
     ...emptyDatabase(),
     ...parsed,
     version: 2,
+    // `egressAllow` postdates the first v2 files. The type says `string[]`, and
+    // `approvals.ts` pushes into it, so a row loaded without the key would
+    // throw on the first "Allow for this run" of a declassify card.
+    runTokens: (parsed.runTokens ?? []).map((token) => ({
+      ...token,
+      egressAllow: token.egressAllow ?? [],
+      // A taint written before `trust` existed defaults to "untrusted": the
+      // safe direction, since the check it feeds refuses an outbound action.
+      taints: (token.taints ?? []).map((taint) => ({ ...taint, trust: taint.trust ?? "untrusted" })),
+    })),
+    // Undefined is already falsy is already untrusted, but the type would be
+    // lying about a field `gateway.ts` reads on every borrowed read.
+    policyGrants: (parsed.policyGrants ?? []).map((grant) => ({
+      ...grant,
+      trustContent: grant.trustContent ?? false,
+    })),
     agents: parsed.agents.map((agent) => ({
       ...agent,
       ownerId: agent.ownerId ?? defaultOwner,

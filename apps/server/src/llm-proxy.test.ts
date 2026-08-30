@@ -40,6 +40,7 @@ async function setup() {
       ownerId: "user-jean",
       scp: [],
       taints: [],
+      egressAllow: [],
       issuedAt: new Date().toISOString(),
       expiresAt: new Date(Date.now() + 60_000).toISOString(),
       revokedAt: null,

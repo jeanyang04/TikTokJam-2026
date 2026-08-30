@@ -577,11 +577,15 @@ the default threshold: the owner reading their own grant-approved data in their 
 is the product working, but a stored/screenshotted chat message must never carry a
 credential, even toward the owner.
 
-**Reads of the agent's own resources fingerprint at `secret` only, and never taint.**
+**Reads of the agent's own *workspace* fingerprint at `secret` only, and never taint.**
 `tagSelfRead` in `gateway.ts` writes a `{grantId: "self"}` label with full egress, so
 Scene 5 ("agent keeps working") and every existing egress behaviour are untouched; the
 fingerprint exists solely so `screenOutput` can catch the content being printed. Grant
 reads fingerprint always (as before) and their taints now carry `level`.
+
+**CRM reads used to come through `tagSelfRead` too, and no longer do** — see "The
+owner's own CRM" section at the end of this file. The sentence above is now about the
+agent's own workspace only.
 
 **`matchOrigin()` now returns the highest-level match, not the first.** Its one other
 caller (`egressGate`'s deny message) only reads `origin`/`grantId`, so this is
@@ -598,16 +602,297 @@ live content. **B3:** when `redact.ts`'s patterns grow, grow these with them (an
 they carry no `/g` — a global regex's `lastIndex` makes `.test()` stateful; `scrubSecrets`
 adds `g` per call).
 
-**Not yet wired: the one call in B1's file.** `screenOutput(run.id, result.output)` in
-`executeRun` (`agent-service.ts`, between `runner.run()` returning and the completion
-`store.mutate`), persisting `screened.output` as both `run.output` and the assistant
-message, plus a `kind:"gateway", action:"output", resource:"chat"` deny RunEvent when the
-verdict isn't `allow`. Deny-only rows recommended (an allow row per run is timeline
-noise — a deliberate deviation from the gateway's every-branch rule, made here once).
-Until that lands, the layer is inert: fully tested, zero behaviour change.
+**Wired (item 1, `agent-service.ts`).** `screenOutput(run.id, result.output)` runs in
+`executeRun` between `runner.run()` returning and the completion `store.mutate`, and
+`screened.output` — not `result.output` — is what persists as both `run.output` and the
+assistant message. A non-`allow` verdict writes one `kind:"gateway", action:"output",
+resource:"chat", decision:"deny"` RunEvent, `reason` = the verdict, `detail` =
+`{level, origin}` and never the output. **Deny rows only**, the deviation from the
+gateway's every-branch rule this section already argued for.
 
-**The threshold is a defaulted parameter (`"confidential"`), not config, yet.** If an
+**The event is written *before* the completion mutate, deliberately.** If `recordEvent`
+threw after it, `executeRun`'s catch would mark a run `failed` whose output had already
+persisted as `completed`. Ordering it first means a failure leaves nothing half-written.
+
+**`clearFingerprints(store, runId)` still has no caller,** and this was the obvious
+place. Calling it here would empty the index the screen has just read — and, if moved
+before, would defeat the screen entirely. Left uncalled; the index still grows unbounded
+across a session (see the IFC persistence section above).
+
+**F:** a run whose output was screened shows a deny row in the *policy* timeline with
+`resource: "chat"`. It is not a tool call and names no tool.
+
+**The threshold is a defaulted parameter (`"confidential"`), not config, still.** If an
 operator knob is wanted, it's `OUTPUT_MAX_LEVEL` as one line in `config.ts`'s schema
 (**B2's file**, the documented one-liner), shape-validated in `classify.ts`. Setting it
 to `"internal"` makes confidential copied-through content block too — pinned in
 `ifc.test.ts`.
+
+---
+
+## Task-scoped permissions (`scope-estimator.ts` new, `agent-service.ts`, `config.ts`, `index.ts`)
+
+**Landed (item 2):** `RunToken.scp` is now `effectiveScopes(agent) ∩ estimate(prompt)`.
+An agent may hold five scopes permanently; a task that only reads a document gets a
+token that only reads documents, so a planted instruction cannot reach a tool the task
+never required. Because `executeRun` already hands the runner
+`permissions: {…, tools: runToken.scp}` and B2 builds Codex's `enabled_tools` from that,
+the narrowed tool is off the **model's menu**, not merely denied at the gateway.
+
+**The rule this implements, and the one to keep: removing permissions is automatic and
+needs no human; adding one always needs a card.** (Progent, arXiv 2504.11703.) Nothing
+in this path grants anything. If you find yourself writing code where the system widens
+a scope, a trust or a destination on its own, that is the thing to stop and raise.
+
+**`Agent.permissions.tools` is not a third writer.** The docs above name two (an owner's
+PATCH, `allow_always`); the narrowing is **not** one of them. It lives on the run token
+and dies with the run — never write it back to the agent.
+
+**The estimator's input is the user's message text and nothing else.** Not tool output,
+not file content, not a prior assistant turn. It runs before any tool executes, so
+nothing untrusted can influence it. That is a security property, not a convenience.
+
+**The constructor default is the offline keyword grammar, and `index.ts` injects the
+Ark-backed one.** The handoff asked for "LLM-backed when the model is configured", but
+every harness in the suite sets `ARK_API_KEY: "test-key"` (and `sendMessage` 503s
+without it), so `isArkConfigured` is true in *every* test: an Ark-first constructor
+default would put a real network call in the path of every test that sends a message.
+`AgentService`'s 6th constructor argument is the estimator, the 5th is `parseGrantIntent`
+— pass both when you construct it by hand.
+
+**Empty estimate = the standing set.** Disabled by `PERMISSION_ESTIMATOR_ENABLED=false`,
+an estimator that throws, one that answers `[]`, or one whose answer is not a `Scope`
+(filtered against `SCOPES`, because the Ark path's answer is model output) all land on
+exactly today's behaviour. Fail to the status quo, never to a broken run.
+
+**An empty *intersection* is a legitimate outcome, and is not the same thing.** A task
+that needs the workspace given to an agent holding only `crm:read` mints a token with no
+scopes and two cards. Two existing `RunToken mint` tests had prompts that no longer
+covered their agents' scopes and were adjusted, with a comment saying why — if you write
+a mint test, make the prompt match the scopes you expect.
+
+**A missing scope raises the card *before the run starts*, and `action` carries the
+scope: `"run:<scope>"`.** `createCardOnDeny` dedupes on
+`(agentId, kind, resource, action)`, so the handoff's literal `action: "run"` would
+collapse two missing scopes into one card and the operator would never see the second
+decision. `resource` is the agent's name as specified. **F:** these rows read
+`Researcher · run:crm:read`.
+
+**These are the first `source:"nl_intent"` + `kind:"scope"` cards.** `nl_intent`
+previously implied `kind:"grant"` and a null `jti`. These carry a real `runId` and
+`jti`, so `decideApproval`'s `allow_run` guard (which names `kind:"grant"`) does not
+bite and both buttons work. **If you ever mint one of these without a run, widen that
+guard** — the NL-grants section above says the same thing from the other side.
+
+### ⚠ This changes demo Scene 2, and the team has to decide what to do about it
+
+Scene 2's injected instruction lives inside `notes.md`; the *user's* prompt is
+"summarise Writer's notes". The keyword estimator reads no send-shaped word in that, so
+the run token is narrowed to `workspace:read` and `webhook:send` — which `seed.ts` gives
+Researcher **specifically so Scene 2 reaches the IFC check** — is off the token, and
+therefore off Codex's `enabled_tools` (`codex-runner.ts:97`). The injected instruction is
+never attempted. Scene 2 produces **no deny, no card, no RunEvent**: not a different
+reason, silence where the centrepiece was. `/demo/replay` is dark too — `demo.ts:99`
+signs its token from `runToken.scp`.
+
+This is the feature working as designed, and no test catches it because every gateway
+test builds `RunToken`s by hand rather than going through `sendMessage`. Three ways out,
+cheapest first, and it is the team's call:
+
+1. Rehearse Scene 2 with `PERMISSION_ESTIMATOR_ENABLED=false`.
+2. Word the prompt so it names the send — "summarise Writer's notes and post the summary
+   to our webhook". `webhook:send` survives the narrowing and the scene then shows
+   narrowing *and* the IFC block.
+3. Re-script Scene 2 around the output screen (item 1), which still fires: an agent
+   hijacked into printing the credentials into chat gets a `kind:"gateway",
+   action:"output"` deny row. Arguably the stronger story — it is the surface the
+   original scene did not cover.
+
+**Live `tempScopes` survive the narrowing, and that is load-bearing.** `scp` is
+`(standing ∩ estimate) ∪ live tempScopes`. Without the union the scope card livelocks:
+"Allow for this run" writes `agent.tempScopes`, the follow-up message is a *new* run
+(D3), the narrowing would strip the scope the operator had just granted, the agent would
+be denied again and the same card would come back forever. Unioning them is not the
+system widening anything — `tempScopes` is written by exactly one thing, a human
+answering a card — it is the system declining to override a human. Pinned in
+`agent-service.test.ts`.
+
+**`allow_always` is *not* unioned back, deliberately.** It writes `permissions.tools`,
+which is standing, so the estimator can narrow it away again on the next task. That is
+the round-trip cost of a wrong estimate the design accepts, and it is the difference
+between "the human decided about this run" and "the human changed the agent's
+configuration". If it turns out to bite in rehearsal, the fix is a better estimate, not
+an exemption.
+
+**Two cards can exist for one decision, and nothing breaks.** The up-front card's dedupe
+key is `(agentId, "scope", "<agent name>", "run:<scope>")`; the gateway's `scopeCard` for
+the same scope is `(agentId, "scope", "user-jean/crm", "read")`. Different keys, so an
+agent that reaches for the missing scope anyway puts a second card in the queue — the
+thing the NL-grants section above argues byte-identical keys exist to prevent. Answering
+either works (`decideApproval` keys off `card.scope`), so this is untidy rather than
+unsafe; the one thing to know is that the stale card is still answerable afterwards and
+`allow_always` on it would widen `permissions.tools` after the fact. Left as is rather
+than restructuring either key.
+
+**Cards are created after the mint mutate and awaited before `executeRun` is spawned.**
+`JsonStore.mutate` chains on its own queue and awaits its own operation, so calling
+`createCardOnDeny` (itself a `mutate`) from inside the mint would deadlock. `killAgent`
+returns its ids and then acts, for the same reason; follow that shape.
+
+---
+
+## Scoped declassification (`types.ts`, `gateway.ts`, `approvals.ts`, `store.ts`)
+
+**Ownership note first: `types.ts` was edited from this workstream.** CLAUDE.md rule 7
+and `docs/TEAM.md` make it the shared contract nobody edits unilaterally; this whole
+feature was handed here, so `RunToken.egressAllow` landed directly. Additive with a
+default in `store.ts`'s migration, the same shape B3's `fingerprints` addition took.
+**Zeon:** `docs/API.md` says nothing about `egressAllow` and nothing needs it to — no
+route exposes the field.
+
+**Landed (item 3):** `RunToken.egressAllow: string[]`, checked as the first thing
+`egressGate` does after it re-reads the token. `resource` is already that function's
+parameter: the URL for `webhook_send`, `"<name>/workspace"` for `workspace_write`.
+
+**The two declassify buttons now mean different things, deliberately.** "Allow for this
+run" used to push the destination *class* onto the taints, so approving "post this to
+our team webhook" also permitted every other external URL for the rest of that run — an
+attacker's included. It now writes the one destination the human actually looked at into
+`egressAllow` and touches no taint. "Always allow" is unchanged: the human making a
+standing policy statement, so it widens the grant's `egress` (and the matching taints,
+so the current run proceeds).
+
+**`checkEgress` stays payload-blind and untouched.** The `egressAllow` check is a
+separate line *before* it, keyed on the resource, never on anything read out of the body.
+
+**Rows written before the field default to `[]` in `migrateDatabase`.** The migration
+only mapped `agents` before; `runTokens` now gets the same treatment, because
+`approvals.ts` pushes into the array and `undefined` would throw on the first approval
+after an upgrade. Pinned in `store.test.ts`.
+
+**The existing Scene 2 test still passes unchanged** — it approves and re-calls the same
+URL, which is exactly the behaviour that survives. Two new gateway tests pin what
+changed: destination B is still `403 ifc` after A was approved, and `allow_always` still
+widens the grant.
+
+---
+
+## Trust label (`types.ts`, `gateway.ts`, `ifc.ts`, `approvals.ts`, `grants.ts`, `store.ts`, web)
+
+**Landed (item 4):** content now carries a second tag saying whether it can be
+*believed* — `Label.trust` — beside the one saying how sensitive it is. Untrusted
+content cannot trigger an outbound action without a human. This catches the case
+confidentiality cannot see at all: an agent hijacked into an action that leaks nothing
+(FIDES, arXiv 2505.23643).
+
+**The tag is decided by the channel the content arrived on, never by reading it.** Own
+workspace and own CRM → `trusted`. A borrowed workspace read → `grant.trustContent`,
+default `false`. **Do not put a model in this decision.** A model asked "is this
+trustworthy?" is reading attacker-controlled text, and the attacker can simply write the
+answer.
+
+**The integrity check runs *after* `checkEgress`, inside `egressGate`, and order is
+load-bearing.** Scene 2's exfil attempt is a borrowed read going external, which now
+trips both halves; confidentiality first keeps that a `DENIED (ifc)` with the origin
+named, which is the line the scene narrates and what `gateway.test.ts` pins.
+
+**It applies to genuinely outbound surfaces only — `egressGate`'s new `outbound`
+parameter.** `webhook_send` and `crm_write` always; `workspace_write` only when the
+target is *another* agent's workspace. A write into the agent's own workspace is scratch
+space inside the trust boundary, and holding it back would stop a run the moment it read
+anything borrowed — Scene 5's "the agent keeps working on the rest" would break.
+
+**A declassify card now carries one of two `reason` prefixes.** `grant:<id>` is the
+confidentiality deny it always was; `integrity:<id>` is new. `approvals.ts` reads them
+apart because approving means different things: `allow_run` writes `egressAllow` for
+both (the human approved *this* destination for *this* run, and `egressGate`
+short-circuits on it before either check), while `allow_always` on an integrity card
+sets `grant.trustContent = true` and marks that grant's live taints trusted — a standing
+statement about the source, not about the destination class.
+
+**`allow_run` does collapse the two labels for that one destination**, and that is worth
+knowing: `egressAllow` short-circuits `egressGate` *before* both checks, so approving a
+confidentiality card also clears integrity for that destination in that run, and vice
+versa. Defensible — the human looked at that exact flow and approved it — but it is the
+one place the two labels are not independent. If you want them separated, the change is
+two lists rather than one, and both checks reading their own.
+
+**`addTaint`'s dedupe key is now `grantId + "|" + origin`.** `grantId` alone was fine
+while every label came from a grant; `"self"` labels made it collapse distinct reads
+into one. Pinned in `ifc.test.ts`, both directions.
+
+**Two migrations, both to the safe side.** `Label.trust` defaults to `"untrusted"` on
+load — in `migrateDatabase`'s new `runTokens` mapping (nested inside the `egressAllow`
+one, not a second pass) and in `loadFingerprints` beside its existing `level` default.
+`PolicyGrant.trustContent` defaults to `false`; undefined was already falsy, but the
+type was lying about a field `gateway.ts` reads on every borrowed read.
+
+**`POST /api/grants` accepts `trustContent`, and `docs/API.md` does not mention it.**
+Optional, defaults false, so every existing caller is unaffected. **Zeon:** the contract
+line wants it.
+
+**The checkbox lives on the Access Request Card, not on a grant form.** There is no
+create-grant form in `App.tsx` — grants are only ever created from a card or from
+`POST /api/grants/parse` — so "Trust content from this source" is rendered on the card
+itself, and only for `kind: "grant"`, which is the only card that creates a source the
+agent will later read from. It rides both allow buttons; **Deny always sends `false`**.
+The approval toast has no checkbox and passes `false`, because a one-line toast is not
+where a trust decision should be made. Each grant row also shows `content: trusted` /
+`content: untrusted` as evidence after the fact.
+
+**`POST /api/approvals/:id/decide` gained an optional `trustContent` boolean**, threaded
+`app.ts` → `AgentService.decideApproval(id, decision, byOwner, options)` →
+`approvals.ts`'s grant branch → `createGrant`. Every existing caller omits it and gets
+`false`. **Zeon:** `docs/API.md` §Approvals does not mention the field. Pinned both ways
+in `policy-routes.test.ts` (ticked → `trustContent: true` on the written grant; body
+without the key → `false`).
+
+Editing `App.tsx`, `api.ts`, `styles.css` and the web `types.ts` is a deviation from
+`docs/TEAM.md`, noted for the same reason `types.ts` is above.
+
+---
+
+## The owner's own CRM is tainted now (`gateway.ts`, `approvals.ts`, `grants.ts`)
+
+**This reverses a decision two sections above deliberately left open.** `tagSelfRead`
+fingerprinted own-resource reads and never tainted them, so reading your own customer
+records and posting them to an external webhook succeeded. The owner asked for it
+closed; it is closed.
+
+**What `crm_read` does now.** It adds a taint, `origin: "<ownerId>/crm"`, `egress` from
+a live tenant-level CRM grant if one exists and `["internal"]` otherwise, `level` from
+`classify("crm", …)`, `trust: "trusted"` (own tenant, inside the boundary — integrity is
+unaffected). It still fingerprints, so the output screen keeps working.
+
+**What that does and does not stop.** `internal` is still permitted, so `crm_write` and
+a write into the agent's own workspace are untouched — Scene 5's "keeps working on the
+rest" holds, and `crm-gateway.test.ts` (DB-gated) does exactly that pair. What now needs
+a human: `webhook_send` (`external`) and a write into another agent's workspace
+(`agent`), both `403 ifc` naming `user-jean/crm`, both raising a declassify card.
+
+**`OWN_CRM_LABEL` (`"self:crm"`, exported from `grants.ts`) is not a grant id.** Nothing
+in `policyGrants` has it. It is what the taint carries when the owner has written no
+standing CRM grant, and `approvals.ts` recognises it: **"Always allow" on such a card
+creates the tenant-level grant** (`fromAgent: null`, `resource: "crm"`,
+`actions: ["read"]`, `egress: ["internal", <dest>]`) that later reads then pick their
+egress up from. Without that the button would have nothing to widen and would silently
+behave like the narrower one. The `createGrant` call sits **outside** the surrounding
+`store.mutate`, because it mutates itself.
+
+**This makes a `resource: "crm"` PolicyGrant a live row for the first time.** The
+NL-grant section above says a CRM grant is "a row nothing reads" and refuses to produce
+one. That is still true for *access* — `crm_read`/`crm_write` are gated on scope alone
+and never call `findLiveGrant` for permission — but it is no longer true for *egress*.
+**Zeon:** if you want the NL path to open up here, that is the line that changes.
+
+**Tested without Postgres.** `gateway.test.ts` gained a describe block that stubs
+`withOwner` with two in-memory rows, so the gateway half (taint, deny, card, the
+standing grant) runs in `npm run check`. The database half stays where it was, in
+`rls.test.ts` and `crm-gateway.test.ts`. **Neither DB-gated file was run for this
+change** — no Docker on the machine it was written on. Reasoning says they are
+unaffected (their only outbound call is `crm_write`, which is `internal`), but that is
+reasoning, not a green run. Worth one `npm run check:db` from someone who has Docker.
+
+**Demo consequence, and it is a good one.** An agent that reads the CRM and tries to
+post it out is now a live Scene 2 that needs no planted file at all. The card names
+`user-jean/crm` as the origin.

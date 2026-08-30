@@ -271,8 +271,12 @@ function ApprovalCard({
   agentName: string;
   deciding: boolean;
   disabled: boolean;
-  onDecide: (decision: ApprovalDecision) => void;
+  onDecide: (decision: ApprovalDecision, trustContent: boolean) => void;
 }) {
+  // Only a grant card creates a source the agent will later read from, so this
+  // is the only card where trusting the content is a question. Off by default:
+  // borrowed content cannot drive an outbound action unless a human says so.
+  const [trustContent, setTrustContent] = useState(false);
   return (
     <article className="approval-card">
       <h3>{agentName} requests access</h3>
@@ -291,19 +295,36 @@ function ApprovalCard({
           {approval.grant.egress.join(", ")}
         </p>
       )}
+      {approval.kind === "grant" && (
+        <label className="approval-trust">
+          <input
+            type="checkbox"
+            checked={trustContent}
+            disabled={disabled}
+            onChange={(event) => setTrustContent(event.target.checked)}
+          />
+          <span>
+            Trust content from this source
+            <small>
+              Leave off and the agent can read it, but cannot act on it outward without asking
+              you again.
+            </small>
+          </span>
+        </label>
+      )}
       {deciding && (
         <div className="approval-saving">
           <Spinner /> Saving decision…
         </div>
       )}
       <div className="approval-actions">
-        <button className="button approval-deny-button" disabled={disabled} onClick={() => onDecide("deny")}>
+        <button className="button approval-deny-button" disabled={disabled} onClick={() => onDecide("deny", false)}>
           Deny
         </button>
-        <button className="button button-ghost" disabled={disabled} onClick={() => onDecide("allow_run")}>
+        <button className="button button-ghost" disabled={disabled} onClick={() => onDecide("allow_run", trustContent)}>
           Allow for this run
         </button>
-        <button className="button button-primary" disabled={disabled} onClick={() => onDecide("allow_always")}>
+        <button className="button button-primary" disabled={disabled} onClick={() => onDecide("allow_always", trustContent)}>
           Always allow
         </button>
       </div>
@@ -1115,6 +1136,8 @@ export default function App() {
   const decideApproval = async (
     approval: ApprovalRequest,
     decision: ApprovalDecision,
+    // The card's checkbox. The toast has no checkbox, so it stays false there.
+    trustContent = false,
   ) => {
     if (approval.status !== "pending") return;
     const sessionVersion = sessionVersionRef.current;
@@ -1123,7 +1146,7 @@ export default function App() {
     setSecurityNotice(null);
     setError(null);
     try {
-      const { approval: decided } = await api.decideApproval(approval.id, decision);
+      const { approval: decided } = await api.decideApproval(approval.id, decision, trustContent);
       if (mountedRef.current && sessionVersion === sessionVersionRef.current) {
         setApprovals((current) =>
           current.map((item) => item.id === decided.id ? decided : item),
@@ -1768,7 +1791,7 @@ export default function App() {
                         agentName={selected.name}
                         deciding={decidingApprovalId === approval.id}
                         disabled={decidingApprovalId !== null}
-                        onDecide={(decision) => void decideApproval(approval, decision)}
+                        onDecide={(decision, trustContent) => void decideApproval(approval, decision, trustContent)}
                       />
                     ))}
                   </div>
@@ -1911,7 +1934,7 @@ export default function App() {
                       agentName={selected.name}
                       deciding={decidingApprovalId === approval.id}
                       disabled={decidingApprovalId !== null}
-                      onDecide={(decision) => void decideApproval(approval, decision)}
+                      onDecide={(decision, trustContent) => void decideApproval(approval, decision, trustContent)}
                     />
                   ))}
                 </div>
@@ -1965,6 +1988,11 @@ export default function App() {
                                   {grant.egress.map((egress) => (
                                     <span key={egress}>egress: {egress}</span>
                                   ))}
+                                  <span>
+                                    {grant.trustContent
+                                      ? "content: trusted"
+                                      : "content: untrusted"}
+                                  </span>
                                 </div>
                                 <div className="grant-lifetime">
                                   {state === "revoked" && grant.revokedAt

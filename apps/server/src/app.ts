@@ -55,9 +55,15 @@ const grantBody = z.object({
   resource: z.enum(["workspace", "crm"]),
   actions: z.array(z.enum(["read", "write"])).min(1),
   egress: z.array(z.enum(["internal", "agent", "external"])).optional(),
+  // "Trust content from this source": may what the recipient reads here
+  // trigger an outbound action? Omitted = false, the safe direction.
+  trustContent: z.boolean().optional(),
 });
 const decideBody = z.object({
   decision: z.enum(["allow_run", "allow_always", "deny"]),
+  // "Trust content from this source", ticked on a grant card. Omitted = false,
+  // the safe direction: borrowed content cannot drive an outbound action.
+  trustContent: z.boolean().optional(),
 });
 // Bounded because it is forwarded to a model: a long body is a prompt-injection
 // surface and a cost, not a richer request.
@@ -312,8 +318,10 @@ export async function createApp(
 
   app.post("/api/approvals/:id/decide", async (request) => {
     const { id } = approvalIdParams.parse(request.params);
-    const { decision } = decideBody.parse(request.body);
-    return { approval: await service.decideApproval(id, decision, callerOf(request)) };
+    const { decision, trustContent } = decideBody.parse(request.body);
+    return {
+      approval: await service.decideApproval(id, decision, callerOf(request), { trustContent }),
+    };
   });
 
   app.get("/api/runs/:id/events", async (request) => {

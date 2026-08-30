@@ -255,6 +255,71 @@ describe("Approval routes", () => {
     await app.close();
   });
 
+  it("carries the card's trust checkbox onto the grant it writes", async () => {
+    const { app, service, store, as } = await makeHarness();
+    const writer = await service.createAgent({ name: "Writer" }, "user-jean");
+    const researcher = await service.createAgent({ name: "Researcher" }, "user-jean");
+    const grantCard = await seedCard(store, researcher, {
+      kind: "grant",
+      resource: "Writer/workspace",
+      action: "read",
+      scope: null,
+      grant: {
+        fromOwner: "user-jean",
+        fromAgent: writer.id,
+        toAgent: researcher.id,
+        resource: "workspace",
+        actions: ["read"],
+        egress: ["internal"],
+      },
+    });
+
+    const decided = await app.inject({
+      method: "POST",
+      url: "/api/approvals/" + grantCard.id + "/decide",
+      headers: await as("user-jean"),
+      payload: { decision: "allow_always", trustContent: true },
+    });
+
+    expect(decided.statusCode).toBe(200);
+    expect(store.snapshot().policyGrants.at(-1)).toMatchObject({
+      toAgent: researcher.id,
+      trustContent: true,
+    });
+    await app.close();
+  });
+
+  it("leaves a grant untrusted when the checkbox is not ticked", async () => {
+    const { app, service, store, as } = await makeHarness();
+    const writer = await service.createAgent({ name: "Writer" }, "user-jean");
+    const researcher = await service.createAgent({ name: "Researcher" }, "user-jean");
+    const grantCard = await seedCard(store, researcher, {
+      kind: "grant",
+      resource: "Writer/workspace",
+      action: "read",
+      scope: null,
+      grant: {
+        fromOwner: "user-jean",
+        fromAgent: writer.id,
+        toAgent: researcher.id,
+        resource: "workspace",
+        actions: ["read"],
+        egress: ["internal"],
+      },
+    });
+
+    // No `trustContent` in the body at all: the safe direction is the default.
+    await app.inject({
+      method: "POST",
+      url: "/api/approvals/" + grantCard.id + "/decide",
+      headers: await as("user-jean"),
+      payload: { decision: "allow_always" },
+    });
+
+    expect(store.snapshot().policyGrants.at(-1)?.trustContent).toBe(false);
+    await app.close();
+  });
+
   it("rejects an unknown decision", async () => {
     const { app, service, store, as } = await makeHarness();
     const agent = await service.createAgent({ name: "Researcher" }, "user-jean");

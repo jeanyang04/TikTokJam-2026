@@ -31,6 +31,8 @@ export interface PolicyGrant {
   resource: Resource;
   actions: GrantAction[];
   egress: Egress[];
+  /** May content read under this grant trigger an outbound action? Default false. */
+  trustContent: boolean;
   createdAt: string;
   expiresAt: string | null;
   revokedAt: string | null;

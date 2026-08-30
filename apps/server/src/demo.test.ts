@@ -64,6 +64,7 @@ describe("Scene 2 replay", () => {
         ownerId: "user-jean",
         scp: ["workspace:read", "webhook:send"],
         taints: [],
+        egressAllow: [],
         issuedAt,
         expiresAt: new Date(Date.now() + 60_000).toISOString(),
         revokedAt: null,

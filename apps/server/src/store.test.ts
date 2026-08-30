@@ -167,6 +167,36 @@ describe("v1 → v2 migration", () => {
     expect(store.snapshot()).toEqual(v2Database);
   });
 
+  it("defaults egressAllow on a RunToken row written before the field existed", async () => {
+    const store = await storeWith({
+      version: 2,
+      agents: v1Database.agents,
+      messages: [],
+      runs: [],
+      runTokens: [
+        {
+          jti: "t-old",
+          runId: "run-old",
+          agentId: "agent-1",
+          ownerId: "user-jean",
+          scp: ["workspace:read"],
+          taints: [],
+          issuedAt: "2026-08-01T00:00:00.000Z",
+          expiresAt: "2026-08-01T01:00:00.000Z",
+          revokedAt: null,
+        },
+      ],
+      policyGrants: [],
+      approvals: [],
+      runEvents: [],
+      fingerprints: [],
+    });
+    await store.initialize();
+
+    // `approvals.ts` pushes into this on "Allow for this run"; undefined throws.
+    expect(store.snapshot().runTokens[0]?.egressAllow).toEqual([]);
+  });
+
   it("refuses to boot on a store file it does not understand", async () => {
     const store = await storeWith({ ...v1Database, version: 3 });
     await expect(store.initialize()).rejects.toThrow("Unsupported database format");

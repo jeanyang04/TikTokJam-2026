@@ -1184,6 +1184,28 @@ button {
   font-size: inherit;
 }
 
+.approval-trust {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin-top: 12px;
+  color: var(--ink);
+  font-size: 12px;
+  line-height: 1.5;
+  cursor: pointer;
+}
+
+.approval-trust input {
+  margin: 2px 0 0;
+  flex: none;
+}
+
+.approval-trust small {
+  display: block;
+  margin-top: 2px;
+  color: var(--muted);
+}
+
 .approval-saving {
   display: flex;
   align-items: center;
