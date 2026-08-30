@@ -21,6 +21,7 @@ import type {
   WorkspaceFile,
   WorkspaceFileContent,
 } from "./types";
+import { pendingApprovalsForAgent } from "./approval-state";
 
 const starterPrompts = [
   "Create a small TypeScript CLI that prints a weather summary from sample JSON.",
@@ -572,8 +573,8 @@ export default function App() {
   // Scoped to the agent actually on screen — a request for a different
   // agent must never surface here (that's what the toast is for).
   const selectedAgentPendingApprovals = useMemo(
-    () => pendingApprovals.filter((approval) => approval.agentId === selected?.id),
-    [pendingApprovals, selected],
+    () => pendingApprovalsForAgent(pendingApprovals, selected?.id ?? null),
+    [pendingApprovals, selected?.id],
   );
   const visibleModalApprovals = useMemo(
     () =>
@@ -588,26 +589,10 @@ export default function App() {
     () => grants.filter((grant) => grantState(grant) === "active").length,
     [grants],
   );
-  const latestBlockedEvent = useMemo(() => {
-    if (!activeRun) return null;
-    const policyEvents = events.filter(
-      (event) =>
-        event.runId === activeRun.id &&
-        ["gateway", "approval", "grant"].includes(event.kind),
-    );
-    const latest = policyEvents.at(-1) ?? null;
-    return latest?.decision === "deny" ? latest : null;
-  }, [activeRun, events]);
-  const blockedEventHasCard = useMemo(
-    () =>
-      latestBlockedEvent !== null &&
-      pendingApprovals.some(
-        (approval) =>
-          approval.agentId === latestBlockedEvent.agentId &&
-          approval.runId === latestBlockedEvent.runId,
-      ),
-    [latestBlockedEvent, pendingApprovals],
-  );
+  // A blocked callout represents unresolved work, not whichever policy event
+  // happened most recently. Keep it stable while its Access Request Card is
+  // pending; unrelated allowed calls and event polling must not hide it.
+  const blockedApproval = selectedAgentPendingApprovals[0] ?? null;
   const isProcessing = useMemo(
     () =>
       (activeRun != null && ["queued", "running"].includes(activeRun.status)) ||
@@ -2050,18 +2035,21 @@ export default function App() {
               </div>
             )}
 
-            {latestBlockedEvent && (
+            {blockedApproval && (
               <aside className="policy-blocked-callout" role="alert">
                 <div className="policy-blocked-icon">!</div>
                 <div>
                   <strong>Action blocked by policy</strong>
                   <p>
-                    {selected.name} could not {formatEventLabel(latestBlockedEvent.action)} → {latestBlockedEvent.resource}.
-                    {latestBlockedEvent.reason ? " Reason: " + latestBlockedEvent.reason + "." : ""}
+                    {selected.name} could not {formatEventLabel(blockedApproval.action)} → {blockedApproval.resource}.
+                    {blockedApproval.reason ? " Reason: " + blockedApproval.reason + "." : ""}
                   </p>
-                  {blockedEventHasCard && (
-                    <span>An Access Request Card is pending.</span>
-                  )}
+                  <span>
+                    An Access Request Card is pending.
+                    {selectedAgentPendingApprovals.length > 1
+                      ? " " + selectedAgentPendingApprovals.length + " requests need a decision."
+                      : ""}
+                  </span>
                 </div>
               </aside>
             )}

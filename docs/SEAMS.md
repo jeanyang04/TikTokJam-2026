@@ -561,6 +561,19 @@ rather than merely compiling.
 
 ---
 
+## Frontend approval state and workspace tests
+
+**Landed:** the red policy-blocked callout is driven by the selected agent's pending
+`ApprovalRequest` rows, not the newest `RunEvent`. Event polling may still update the
+timeline every two seconds, but an unrelated allow can no longer hide an unresolved block;
+the callout disappears only after the card is decided.
+
+`apps/web` now has a Vitest script, and the root `npm test` runs every workspace's test
+script via `--workspaces --if-present`. Add future frontend behavior tests under
+`apps/web/src/*.test.ts`; they are now part of `npm run check`.
+
+---
+
 ## Info tagging / security levels (`classify.ts` new, `types.ts`, `ifc.ts`, `gateway.ts` — Zeon's files)
 
 **Landed (Zeon):** every gateway read is classified (`public < internal < confidential <
