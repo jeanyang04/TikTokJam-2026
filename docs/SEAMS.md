@@ -558,3 +558,56 @@ and — the one existing `gateway.test.ts` Scene 2 test can't show — that `mat
 genuinely fails after the in-memory cache is cleared and genuinely recovers once
 `loadFingerprints()` reloads it from the store, i.e. that this actually survives a restart
 rather than merely compiling.
+
+---
+
+## Info tagging / security levels (`classify.ts` new, `types.ts`, `ifc.ts`, `gateway.ts` — Zeon's files)
+
+**Landed (Zeon):** every gateway read is classified (`public < internal < confidential <
+secret`, `SECURITY_LEVELS` in `types.ts` — compare with `classify.ts`'s `levelRank()`,
+never by string), `Label` gained a `level`, and `ifc.ts` gained `screenOutput()`: chat
+output is the **third egress surface**. Tool calls were already gated by `checkEgress`;
+the run's *final output* becomes a stored chat message and was never checked, so a
+prompt-injected agent could simply print what it may not send.
+
+**What the levels mean here.** `confidential` = provenance (grant-scoped reads, CRM) —
+egress for *tool calls* stays entirely with taints/`checkEgress`, unchanged. `secret` =
+the content detectors fired (credentials-shaped). Only `secret` is withheld from chat at
+the default threshold: the owner reading their own grant-approved data in their own chat
+is the product working, but a stored/screenshotted chat message must never carry a
+credential, even toward the owner.
+
+**Reads of the agent's own resources fingerprint at `secret` only, and never taint.**
+`tagSelfRead` in `gateway.ts` writes a `{grantId: "self"}` label with full egress, so
+Scene 5 ("agent keeps working") and every existing egress behaviour are untouched; the
+fingerprint exists solely so `screenOutput` can catch the content being printed. Grant
+reads fingerprint always (as before) and their taints now carry `level`.
+
+**`matchOrigin()` now returns the highest-level match, not the first.** Its one other
+caller (`egressGate`'s deny message) only reads `origin`/`grantId`, so this is
+behaviour-compatible — but if you add a caller that cares *which* of several matching
+labels comes back, that's the rule.
+
+**Old persisted rows lack `level`.** `loadFingerprints()` defaults them to `"internal"`
+on load; old `RunToken.taints` are never read for level (only fingerprints are), so they
+need no migration. `store.ts` untouched.
+
+**`classify.ts`'s `SECRET_PATTERNS` mirrors the redaction list on purpose and is
+deliberately a separate list** — redaction scrubs the audit trail, classification flags
+live content. **B3:** when `redact.ts`'s patterns grow, grow these with them (and note
+they carry no `/g` — a global regex's `lastIndex` makes `.test()` stateful; `scrubSecrets`
+adds `g` per call).
+
+**Not yet wired: the one call in B1's file.** `screenOutput(run.id, result.output)` in
+`executeRun` (`agent-service.ts`, between `runner.run()` returning and the completion
+`store.mutate`), persisting `screened.output` as both `run.output` and the assistant
+message, plus a `kind:"gateway", action:"output", resource:"chat"` deny RunEvent when the
+verdict isn't `allow`. Deny-only rows recommended (an allow row per run is timeline
+noise — a deliberate deviation from the gateway's every-branch rule, made here once).
+Until that lands, the layer is inert: fully tested, zero behaviour change.
+
+**The threshold is a defaulted parameter (`"confidential"`), not config, yet.** If an
+operator knob is wanted, it's `OUTPUT_MAX_LEVEL` as one line in `config.ts`'s schema
+(**B2's file**, the documented one-liner), shape-validated in `classify.ts`. Setting it
+to `"internal"` makes confidential copied-through content block too — pinned in
+`ifc.test.ts`.

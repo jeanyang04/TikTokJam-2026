@@ -7,6 +7,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 import { decideApproval } from "./approvals.js";
 import { createGrant, revokeGrant } from "./grants.js";
 import { gatewayPlugin, makeJwtVerifier } from "./gateway.js";
+import { screenOutput } from "./ifc.js";
 import { JsonStore, DEFAULT_PERMISSIONS, effectiveScopes } from "./store.js";
 import type { Agent, RunToken, Scope } from "./types.js";
 
@@ -156,6 +157,51 @@ describe("gateway — grant revoke mid-run (Scene 5)", () => {
     await writeFile(path.join(root, "researcher", "own.md"), "still mine", "utf8");
     expect((await call(jwt, "workspace_read", { agent: "Researcher", path: "own.md" })).text).toBe("still mine");
     expect(store.snapshot().runTokens.find((t) => t.jti === "t-res")!.taints[0]!.egress).toEqual([]);
+  });
+});
+
+describe("gateway — info tagging (security levels)", () => {
+  const FAKE_JWT = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJkZW1vIn0.c2ln";
+
+  it("tags a grant-scoped read confidential on the taint, secret when the detectors fire", async () => {
+    const jwt = await researcher();
+    await createGrant(store, { fromAgent: "writer", toAgent: "researcher", resource: "workspace", actions: ["read"] }, "user-jean");
+    await call(jwt, "workspace_read", { agent: "Writer", path: "notes.md" });
+    expect(store.snapshot().runTokens.find((t) => t.jti === "t-res")!.taints[0]).toMatchObject({ level: "confidential" });
+
+    await writeFile(path.join(root, "writer", "service-token.txt"), "service token " + FAKE_JWT + " keep this out of chat", "utf8");
+    await call(jwt, "workspace_read", { agent: "Writer", path: "service-token.txt" });
+    await store.mutate(() => {});
+    expect(store.snapshot().fingerprints.some((f) => f.runId === "run-t-res" && f.label.level === "secret")).toBe(true);
+  });
+
+  it("fingerprints a secret-shaped own-workspace read without tainting, so the output screen catches it in chat", async () => {
+    const jwt = await researcher();
+    const creds = "deploy token " + FAKE_JWT + " for the production environment only";
+    await writeFile(path.join(root, "researcher", "own-creds.txt"), creds, "utf8");
+    const r = await call(jwt, "workspace_read", { agent: "Researcher", path: "own-creds.txt" });
+    expect(r.isError).toBe(false);
+    await store.mutate(() => {});
+
+    // Tagged for the output screen, with self provenance…
+    const row = store.snapshot().fingerprints.find((f) => f.runId === "run-t-res")!;
+    expect(row).toMatchObject({ label: { grantId: "self", origin: "user-jean/Researcher", level: "secret" } });
+    // …but no taint: tool egress of the agent's own data is untouched (Scene 5 stays intact).
+    expect(store.snapshot().runTokens.find((t) => t.jti === "t-res")!.taints).toHaveLength(0);
+
+    // The chat output echoing that read is withheld and names the origin.
+    const screened = screenOutput("run-t-res", "Sure! The file says: " + creds);
+    expect(screened.verdict).toBe("block");
+    expect(screened.output).toMatch(/user-jean\/Researcher/);
+    expect(screened.output).not.toContain(FAKE_JWT);
+  });
+
+  it("does not fingerprint a plain own-workspace read", async () => {
+    const jwt = await researcher();
+    await writeFile(path.join(root, "researcher", "plain.md"), "notes about the quarterly roadmap and nothing else", "utf8");
+    await call(jwt, "workspace_read", { agent: "Researcher", path: "plain.md" });
+    await store.mutate(() => {});
+    expect(store.snapshot().fingerprints).toHaveLength(0);
   });
 });
 

@@ -20,6 +20,21 @@ export const SCOPES: readonly Scope[] = [
 
 /** Where grant-scoped data is allowed to flow (IFC). */
 export type Egress = "internal" | "agent" | "external";
+
+/**
+ * Classification of data a run has read, ordered low → high. Compare ranks
+ * via `levelRank()` in classify.ts, never by string. `confidential` is
+ * provenance (grant-scoped reads, CRM); `secret` is content the detectors
+ * flagged (credentials-shaped) and is what the output screen withholds even
+ * from the owner's own chat.
+ */
+export type SecurityLevel = "public" | "internal" | "confidential" | "secret";
+export const SECURITY_LEVELS: readonly SecurityLevel[] = [
+  "public",
+  "internal",
+  "confidential",
+  "secret",
+];
 export type Resource = "workspace" | "crm";
 export type GrantAction = "read" | "write";
 
@@ -32,9 +47,11 @@ export interface AgentPermissions {
 
 /** Stamp on data read under a grant: where it came from, where it may go. */
 export interface Label {
-  grantId: string;
+  grantId: string; // "self" for own-resource reads the classifier flagged (no grant involved)
   origin: string; // "<ownerId>/<agentId>" or "<ownerId>/crm"
   egress: Egress[];
+  /** How sensitive the read content is. Rows persisted before this field default to "internal" on load. */
+  level: SecurityLevel;
 }
 
 /**
