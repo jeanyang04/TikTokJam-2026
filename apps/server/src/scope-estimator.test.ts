@@ -30,8 +30,8 @@ describe("keyword estimator", () => {
     expect(keywordScopes("summarise notes.md")).not.toContain("webhook:send");
   });
 
-  it("defaults to the workspace pair when nothing matches", () => {
-    expect(keywordScopes("hello")).toEqual(["workspace:read", "workspace:write"]);
+  it("defaults to read-only when nothing matches — never presumes write", () => {
+    expect(keywordScopes("hello")).toEqual(["workspace:read"]);
   });
 });
 

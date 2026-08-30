@@ -54,13 +54,16 @@ const RULES: ReadonlyArray<{ scope: Scope; pattern: RegExp }> = [
 
 /**
  * The deterministic fallback, and the default the service is constructed with
- * so no test reaches the network. A prompt that matches nothing gets the
- * workspace pair: the task is about the agent's own files, which is what a bare
- * "have a look at this" means here.
+ * so no test reaches the network. A prompt that matches nothing gets
+ * `workspace:read` only: a bare "have a look at this" is a read, and presuming
+ * write put a spurious workspace:write card in front of the operator on every
+ * bland follow-up ("go ahead", "yes"). Narrowing is automatic; widening always
+ * asks a human — so when unsure, guess low: a wrong low guess costs the agent
+ * a scope card only if the task truly needed the write.
  */
 export function keywordScopes(prompt: string): Scope[] {
   const hits = RULES.filter((rule) => rule.pattern.test(prompt)).map((rule) => rule.scope);
-  return hits.length > 0 ? [...new Set(hits)] : ["workspace:read", "workspace:write"];
+  return hits.length > 0 ? [...new Set(hits)] : ["workspace:read"];
 }
 
 /** Injected in tests. Ark is never called from the suite. */
