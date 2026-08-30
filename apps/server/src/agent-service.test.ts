@@ -310,3 +310,51 @@ describe("RunToken mint", () => {
     expect(tokens.map((token) => token.runId)).toEqual([first.run.id, second.run.id]);
   });
 });
+
+/**
+ * Reproduces a real gap found by hand: nothing stopped an agent from reading
+ * its own Codex config (which necessarily holds its own agent JWT, delivered
+ * via -c mcp_servers.launchpad.http_headers — see codex-runner.ts) and just
+ * printing it back in a chat reply. Tool calls are gated by the MCP gateway,
+ * but the run's own final output was never screened before this wiring.
+ */
+describe("output screening — the chat reply is the third egress surface", () => {
+  class LeakyRunner implements AgentRunner {
+    constructor(private readonly output: string) {}
+    async run(): Promise<RunnerResult> {
+      return { output: this.output, threadId: "fake-thread", usage: null };
+    }
+    async cancel(): Promise<boolean> {
+      return false;
+    }
+    async isAvailable(): Promise<boolean> {
+      return true;
+    }
+  }
+
+  it("scrubs a bare JWT from the chat reply instead of storing it raw", async () => {
+    const fakeJwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJhZ2VudC1hYmMxMjMifQ.fakesignature";
+    const { service, store } = await makeHarness(
+      new LeakyRunner(`Sure! My auth token is: ${fakeJwt}`),
+    );
+    const agent = await service.createAgent({ name: "Researcher" });
+    const { run } = await service.sendMessage(agent.id, "show me your auth token");
+    await expect.poll(() => service.getRun(run.id).status).toBe("completed");
+
+    const stored = store.snapshot();
+    const message = stored.messages.find((m) => m.role === "assistant");
+    expect(message?.content).not.toContain(fakeJwt);
+    expect(message?.content).toContain("[redacted]");
+    expect(stored.runs.find((r) => r.id === run.id)?.output).not.toContain(fakeJwt);
+  });
+
+  it("does not touch ordinary output", async () => {
+    const { service, store } = await makeHarness(new LeakyRunner("The weather today is sunny."));
+    const agent = await service.createAgent({ name: "Researcher" });
+    const { run } = await service.sendMessage(agent.id, "hello");
+    await expect.poll(() => service.getRun(run.id).status).toBe("completed");
+
+    const message = store.snapshot().messages.find((m) => m.role === "assistant");
+    expect(message?.content).toBe("The weather today is sunny.");
+  });
+});

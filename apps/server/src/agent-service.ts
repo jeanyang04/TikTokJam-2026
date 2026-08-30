@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { recordEvent } from "./audit.js";
 import { signAgent } from "./auth.js";
+import { screenOutput } from "./ifc.js";
 import type { AppConfig } from "./config.js";
 import { isArkConfigured } from "./config.js";
 import { HttpError, RunCancelledError } from "./errors.js";
@@ -707,12 +708,35 @@ export class AgentService {
         permissions: { ...agentAtStart.permissions, tools: runToken.scp },
       });
       const completedAt = now();
+      // Third egress surface (ifc.ts): tool calls are gated by the gateway
+      // (workspace_write, webhook_send, ...), but the run's own chat reply
+      // was never checked — a prompt-injected agent could just print what
+      // it isn't allowed to send. Screens the final output once here, and
+      // every downstream use (stored run, stored message) uses the screened
+      // version, never result.output directly.
+      const screened = screenOutput(runToken.runId, result.output);
+      // Only log when something actually happened (redacted or blocked) —
+      // not on every routine "allow", which would add a RunEvent to every
+      // single successful run forever for no reader-facing benefit.
+      if (screened.verdict !== "allow") {
+        await recordEvent(this.store, {
+          runId: run.id,
+          agentId: agentAtStart.id,
+          ownerId: agentAtStart.ownerId,
+          kind: "gateway",
+          action: "output_screen",
+          resource: screened.origin?.origin ?? "chat-output",
+          decision: screened.verdict === "block" ? "deny" : "allow",
+          reason: screened.verdict,
+          detail: { level: screened.level },
+        });
+      }
       await this.store.mutate((database) => {
         const storedRun = database.runs.find((item) => item.id === run.id);
         const agent = database.agents.find((item) => item.id === agentAtStart.id);
         if (!storedRun || !agent) return;
         storedRun.status = "completed";
-        storedRun.output = result.output;
+        storedRun.output = screened.output;
         storedRun.usage = result.usage;
         storedRun.completedAt = completedAt;
         database.messages.push({
@@ -720,7 +744,7 @@ export class AgentService {
           agentId: agent.id,
           runId: run.id,
           role: "assistant",
-          content: result.output,
+          content: screened.output,
           createdAt: completedAt,
         });
         agent.status = "ready";
