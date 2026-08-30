@@ -20,7 +20,7 @@ import { classify } from "./classify.js";
 import { findLiveGrant, OWN_CRM_LABEL } from "./grants.js";
 import { addTaint, checkEgress, checkIntegrity, fingerprint, matchOrigin } from "./ifc.js";
 import type { JsonStore } from "./store.js";
-import type { Agent, Egress, GrantAction, Label, Resource, RunToken, Scope, SecurityLevel, Trust } from "./types.js";
+import type { Agent, ApprovalEvidence, ApprovalRisk, Egress, GrantAction, Label, Resource, RunToken, Scope, SecurityLevel, Trust } from "./types.js";
 
 export interface AgentClaims {
   sub: string; // agentId
@@ -202,12 +202,69 @@ export const gatewayPlugin: FastifyPluginAsync<GatewayDeps> = async (app, deps) 
       }
     };
 
-    const scopeCard = (scope: Scope, resource: string, action: string): Parameters<typeof createCardOnDeny>[1] => ({
-      source: "live_deny", kind: "scope", agentId: ctx.sub, ownerId: ctx.ownerId, runId: ctx.run, jti: ctx.jti, resource, action, scope, grant: null, reason: "tool " + action + " on " + resource + " denied: missing " + scope,
-    });
-    const grantCard = (target: Agent, action: GrantAction): Parameters<typeof createCardOnDeny>[1] => ({
+    /**
+     * How alarming this card is, and the facts behind it. Everything here is
+     * already computed somewhere else in the pipeline — the task estimate on
+     * the token, the taints, the run's own prompt — and none of it involves a
+     * model. `critical` is only ever the three-way coincidence that *is* the
+     * injection signature: the agent reaching past what the user asked for,
+     * while holding content from outside the trust boundary, pointing outward.
+     * Keeping it that narrow is what stops every card looking urgent, which is
+     * the failure mode a card is supposed to prevent (OWASP ASI09).
+     */
+    const assess = (scope: Scope, action: string, resource: string, dest?: Egress) => {
+      const snapshot = store.snapshot();
+      const token = snapshot.runTokens.find((x) => x.jti === ctx.jti);
+      const taints = token?.taints ?? [];
+      const untrusted = checkIntegrity(taints);
+      const classified = dest ? checkEgress(taints, dest) : null;
+      // No estimate means the estimator had no opinion, not that everything is
+      // out of bounds: `scp` was the standing set unchanged, so nothing here
+      // is outside what the run was set up to do. `?? []` rather than a
+      // non-null assertion because a row can reach here without the field —
+      // a token minted before this landed, or one a test wrote by hand.
+      const estimated = token?.estimated ?? [];
+      const outsideTaskScope = estimated.length > 0 && !estimated.includes(scope);
+      const outward = dest === "external" || dest === "agent";
+      const prompt = snapshot.runs.find((r) => r.id === ctx.run)?.prompt ?? null;
+      const risk: ApprovalRisk =
+        outsideTaskScope && untrusted && outward
+          ? "critical"
+          : outsideTaskScope || untrusted !== null || dest === "external"
+            ? "elevated"
+            : "routine";
+      const evidence: ApprovalEvidence = {
+        userAsked: prompt === null ? null : prompt.length > 300 ? prompt.slice(0, 300) + "…" : prompt,
+        attempting: action + " on " + resource + (dest ? " (" + dest + ")" : ""),
+        outsideTaskScope,
+        untrustedOrigin: untrusted?.origin ?? null,
+        classifiedOrigin: classified?.origin ?? null,
+      };
+      return { risk, evidence };
+    };
+
+    /**
+     * Two different denials wear the same `kind: "scope"`, and the operator
+     * needs to be able to tell them apart. *Missing* means the agent has never
+     * held this scope. *Withheld* means it holds it, and this run did not get
+     * it because the task did not look like it needed it — so a request for it
+     * is the agent reaching past what was asked for, which is a different
+     * question to answer.
+     */
+    const scopeCard = (scope: Scope, resource: string, action: string): Parameters<typeof createCardOnDeny>[1] => {
+      const withheld = store.snapshot().runTokens.find((x) => x.jti === ctx.jti)?.withheld ?? [];
+      const reason = withheld.includes(scope)
+        ? "tool " + action + " on " + resource + " denied: " + scope + " was withheld from this run — the task did not look like it needed it"
+        : "tool " + action + " on " + resource + " denied: missing " + scope;
+      return {
+        source: "live_deny", kind: "scope", agentId: ctx.sub, ownerId: ctx.ownerId, runId: ctx.run, jti: ctx.jti, resource, action, scope, grant: null, reason,
+        ...assess(scope, action, resource),
+      };
+    };
+    const grantCard = (target: Agent, action: GrantAction, scope: Scope): Parameters<typeof createCardOnDeny>[1] => ({
       source: "live_deny", kind: "grant", agentId: ctx.sub, ownerId: ctx.ownerId, runId: ctx.run, jti: ctx.jti, resource: target.name + "/workspace", action, scope: null,
       grant: { fromOwner: target.ownerId, fromAgent: target.id, toAgent: ctx.sub, resource: "workspace", actions: [action], egress: ["internal"] }, reason: "no grant",
+      ...assess(scope, action, target.name + "/workspace"),
     });
     /**
      * One card kind for both halves of the label, distinguished by `reason`:
@@ -215,19 +272,22 @@ export const gatewayPlugin: FastifyPluginAsync<GatewayDeps> = async (app, deps) 
      * content it cannot believe. `approvals.ts` reads that prefix, because the
      * two mean different things to approve.
      */
-    const declassifyCard = (dest: Egress, resource: string): Parameters<typeof createCardOnDeny>[1] => {
+    const declassifyCard = (dest: Egress, resource: string, scope: Scope, action: string): Parameters<typeof createCardOnDeny>[1] => {
       const t = store.snapshot().runTokens.find((x) => x.jti === ctx.jti);
       const blocking = checkEgress(t?.taints ?? [], dest);
       const reason = blocking
         ? "grant:" + blocking.grantId
         : "integrity:" + (checkIntegrity(t?.taints ?? [])?.grantId ?? "");
-      return { source: "live_deny", kind: "declassify", agentId: ctx.sub, ownerId: ctx.ownerId, runId: ctx.run, jti: ctx.jti, resource, action: dest, scope: null, grant: null, reason };
+      return {
+        source: "live_deny", kind: "declassify", agentId: ctx.sub, ownerId: ctx.ownerId, runId: ctx.run, jti: ctx.jti, resource, action: dest, scope: null, grant: null, reason,
+        ...assess(scope, action, resource, dest),
+      };
     };
     const cardFor = (scope: Scope, resource: string, action: string, target?: Agent, grantAction?: GrantAction, dest?: Egress, outbound = true) => () => {
       if (!ctx.token.scp.includes(scope)) return scopeCard(scope, resource, action);
       const taints = store.snapshot().runTokens.find((x) => x.jti === ctx.jti)?.taints ?? [];
-      if (dest && (checkEgress(taints, dest) || (outbound && checkIntegrity(taints)))) return declassifyCard(dest, resource);
-      if (target && grantAction && target.id !== ctx.sub) return grantCard(target, grantAction);
+      if (dest && (checkEgress(taints, dest) || (outbound && checkIntegrity(taints)))) return declassifyCard(dest, resource, scope, action);
+      if (target && grantAction && target.id !== ctx.sub) return grantCard(target, grantAction, scope);
       return null;
     };
 

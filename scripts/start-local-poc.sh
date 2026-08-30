@@ -147,15 +147,35 @@ mkdir -p "$APP_DATA_DIR" "$AGENT_WORKSPACE_ROOT" "$CODEX_HOME"
 log "Persistent state: $local_state_root"
 export CONTAINER_USER="${CONTAINER_USER:-$(id -u):$(id -g)}"
 
-log "Building $runtime_image from Dockerfile.runtime (base: $runtime_base_image)."
-"$engine" build \
-  --file Dockerfile.runtime \
-  --build-arg "NODE_IMAGE=$runtime_base_image" \
-  --build-arg "DEBIAN_MIRROR=$runtime_apt_mirror" \
-  --build-arg "DEBIAN_SECURITY_MIRROR=$runtime_apt_security_mirror" \
-  --build-arg "RUNTIME_APT_PACKAGES=$runtime_apt_packages" \
-  --tag "$runtime_image" \
-  .
+# The build needs the registry, and that is the one step that fails on a
+# network the rest of the POC does not care about — a proxy, IPv6-only DNS,
+# an offline demo room. Skipping is opt-in rather than automatic: silently
+# reusing whatever image happens to be tagged would hide a stale runtime.
+if [[ -n "${SKIP_RUNTIME_BUILD:-}" ]]; then
+  if ! "$engine" image inspect "$runtime_image" >/dev/null 2>&1; then
+    log "SKIP_RUNTIME_BUILD is set but $runtime_image is not present locally."
+    log "Unset it and build once with a working registry connection."
+    exit 1
+  fi
+  log "Skipping the Runtime image build; reusing the local $runtime_image."
+else
+  log "Building $runtime_image from Dockerfile.runtime (base: $runtime_base_image)."
+  if ! "$engine" build \
+    --file Dockerfile.runtime \
+    --build-arg "NODE_IMAGE=$runtime_base_image" \
+    --build-arg "DEBIAN_MIRROR=$runtime_apt_mirror" \
+    --build-arg "DEBIAN_SECURITY_MIRROR=$runtime_apt_security_mirror" \
+    --build-arg "RUNTIME_APT_PACKAGES=$runtime_apt_packages" \
+    --tag "$runtime_image" \
+    .
+  then
+    if "$engine" image inspect "$runtime_image" >/dev/null 2>&1; then
+      log "Build failed, but $runtime_image already exists locally."
+      log "Re-run with SKIP_RUNTIME_BUILD=1 to start against it."
+    fi
+    exit 1
+  fi
+fi
 
 log "Checking that the Runtime can bind-mount the configured state directories."
 preflight_user_args=(--user "$CONTAINER_USER")

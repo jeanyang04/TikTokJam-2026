@@ -941,3 +941,68 @@ hole, which is why it is worth writing down rather than leaving to be rediscover
 read on one turn and printed on the next is not caught. Carrying that would mean either
 copying fingerprint rows to the new run or making the index conversation-scoped —
 `ifc.ts`, not done here.
+
+---
+
+## Card risk + the run's scope breakdown (`types.ts`, `gateway.ts`, `agent-service.ts`, `app.ts`, web)
+
+**Why:** task-scoped permissions were correct and invisible. Nothing exposed
+`RunToken.scp`, so a withheld tool looked on screen like the model choosing not
+to call it. And every card rendered identically, so the card raised by a
+prompt injection looked like the card raised by an honest missing permission —
+which is how automation bias gets its way (OWASP ASI09).
+
+**`RunToken` gained `estimated` and `withheld`** (both `Scope[]`, both default
+`[]` on load). `estimated` is the task estimate `scope-estimator.ts` produced,
+kept because it is the baseline a card is judged against — a scope the agent
+reaches for that is not in it is one the user's own message never implied.
+`withheld` is `standing \ scp` **recorded at mint**, because it cannot be
+recomputed later: the agent's standing permissions may have changed since.
+
+**`ApprovalRequest` gained `risk` and `evidence`.** `risk` is
+`"routine" | "elevated" | "critical"`; `critical` is only ever the three-way
+coincidence that *is* the injection signature — outside the task estimate, **and**
+the run holds untrusted content, **and** the destination is outward. Keeping it
+that narrow is the point: a card that always looks urgent is a card nobody
+reads. `evidence` carries facts, not adjectives — the run's own prompt, what
+the agent is attempting, and the origins that explain it.
+
+**Computed in `gateway.ts`'s `assess()`**, which every card builder spreads.
+No model is involved and nothing new is read: the estimate is on the token, the
+origins come from `checkIntegrity`/`checkEgress`, the prompt from the run row.
+**`agent-service.ts`'s two card sites hard-code `risk: "routine"`** — a
+pre-run scope card is by definition in the estimate with no tool yet run, and an
+NL-intent grant card is the human asking in their own words.
+
+**`assess()` reads `token?.estimated ?? []`, deliberately.** A hand-built
+`RunToken` in a test, or a row minted before this landed, reaches it without the
+field; `[]` means "no opinion", which is the truth about those runs.
+
+**`GET /api/runs/:id` now returns `{ run, scopes }`** where `scopes` is
+`AgentService.getRunScopes(id)` — `{active, withheld, estimated}`, derived from
+the token rather than the token itself, since the row carries a `jti` the
+browser has no business seeing. Ownership was already settled by the handler's
+`assertRunOwnership`, so this needs no new gate.
+
+**Web:** `ApprovalCard` renders the risk band and evidence, and inverts its
+button hierarchy on `critical` (Deny leads, allow paths go quiet). The run
+header shows "N of M tools active this run" with the withheld scopes struck
+through, and stays after the run ends — the narrowing is only demonstrable if
+you can point at it afterwards. **The UI never derives risk**; it renders what
+the server decided (rule 5).
+
+**Withheld tools stay on the model's menu (later change to the above).**
+`executeRun` projects `scp ∪ withheld` into `RunnerRequest.permissions.tools`,
+not `scp`. Enforcement is unchanged — the gateway checks the token's `scp`, so
+offering a withheld tool grants nothing and the call is denied with a `scope`
+card. The reason it is offered at all is evidence: a tool that is simply absent
+produces no attempt, no denial, no card and no audit row, so an injection
+reaching for it is indistinguishable on screen from a model that chose not to
+call it. A scope the agent has never held is in neither set and still never
+reaches the menu.
+
+**`scopeCard` now distinguishes the two denials it covers.** *Missing* = the
+agent has never held this scope. *Withheld* = it holds it and this run did not
+get it, which is the agent reaching past what the task asked for, and a
+different question for the operator to answer. Both stay `kind: "scope"`, so
+`decideApproval` is untouched.

@@ -42,6 +42,11 @@ export function migrateDatabase(raw: unknown, defaultOwner = "user-jean"): Datab
     runTokens: (parsed.runTokens ?? []).map((token) => ({
       ...token,
       egressAllow: token.egressAllow ?? [],
+      // A run minted before task-scoped permissions existed was not narrowed,
+      // so "no opinion" and "nothing withheld" is the truth about it, not a
+      // guess. The UI reads an empty `withheld` as "every tool was active".
+      estimated: token.estimated ?? [],
+      withheld: token.withheld ?? [],
       // Null reads as "same conversation" when taints carry forward, which is
       // right for old rows: they are the newest thing that agent did.
       threadId: token.threadId ?? null,
@@ -54,6 +59,20 @@ export function migrateDatabase(raw: unknown, defaultOwner = "user-jean"): Datab
     policyGrants: (parsed.policyGrants ?? []).map((grant) => ({
       ...grant,
       trustContent: grant.trustContent ?? false,
+    })),
+    // A card written before risk existed was rendered flat, and flat is
+    // `routine`. The evidence default is empty-handed rather than invented:
+    // the UI shows the plain card when there is nothing to juxtapose.
+    approvals: (parsed.approvals ?? []).map((card) => ({
+      ...card,
+      risk: card.risk ?? "routine",
+      evidence: card.evidence ?? {
+        userAsked: null,
+        attempting: card.action + " on " + card.resource,
+        outsideTaskScope: false,
+        untrustedOrigin: null,
+        classifiedOrigin: null,
+      },
     })),
     agents: parsed.agents.map((agent) => ({
       ...agent,
