@@ -57,7 +57,7 @@ const agentClaims = z.object({
  * construction and authenticate agent tokens themselves, so this gate never
  * sees them.
  *
- * PLAN.md §2 lists this set without `/api/auth`, but that list was written
+ * An earlier plan listed this set without `/api/auth`, but that list was written
  * before anyone checked which routes exist: the baseline UI probes `/api/auth`
  * at boot and hangs on its loading screen if the probe fails, so gating it
  * breaks the running app.

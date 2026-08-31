@@ -19,7 +19,7 @@ import { MockWebhookSink } from "./webhook-sink.js";
 
 // B3's redact.ts replaces audit.ts's built-in placeholder pattern list —
 // every RunEvent audit.ts has already written or ever writes goes through
-// this from here on (docs/SEAMS.md's "Audit" section).
+// this from here on.
 setRedactor(redact);
 
 const config = loadConfig();
@@ -30,7 +30,7 @@ const workspaces = new WorkspaceManager(config.workspaceRoot);
 const runner = createRunner(config);
 // The Ark-backed estimator is wired here, not defaulted in the constructor:
 // every test harness has Ark "configured" with a fake key, so the default has
-// to be the offline keyword grammar (docs/SEAMS.md). `parseGrantIntent` is
+// to be the offline keyword grammar. `parseGrantIntent` is
 // passed explicitly only because it sits in front of it in the signature.
 const service = new AgentService(
   config,

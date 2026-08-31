@@ -1,6 +1,6 @@
 # API contract — Identity & Authorization middleware
 
-Shared contract for F (web), B1 (routes), B2 (runtime), B3 (data). Types are in `apps/server/src/types.ts`. Decisions in `docs/PLAN.md §0`.
+Shared contract for F (web), B1 (routes), B2 (runtime), B3 (data). Types are in `apps/server/src/types.ts`.
 Every `/api/*` route requires a **human JWT** (`Authorization: Bearer …`) except `/api/health` and `/api/auth/login`.
 Every gateway/proxy route requires an **agent JWT**.
 
@@ -26,11 +26,23 @@ verifyToken(config, raw, "agent"): Promise<AgentPrincipal | null>   // { typ, ag
 
 **Minting (B1, in `AgentService.sendMessage`)** — inside the existing `store.mutate`:
 ```ts
-const scp = effectiveScopes(storedAgent);            // store.ts: permissions.tools ∪ live tempScopes
-const jti = randomUUID(), expiresAt = new Date(Date.now() + config.codexTimeoutMs + 60_000).toISOString();
-database.runTokens.push({ jti, runId, agentId, ownerId: storedAgent.ownerId, scp, taints: [], issuedAt: timestamp, expiresAt, revokedAt: null });
-// then: token = await signAgent(config, { sub: agentId, own: storedAgent.ownerId, run: runId, jti, scp, expiresInSeconds: config.codexTimeoutMs / 1000 + 60 })
-// pass { token, permissions: { ...storedAgent.permissions, tools: scp } } into executeRun → runner.run()
+const standing = effectiveScopes(storedAgent);       // store.ts: permissions.tools ∪ live tempScopes
+const estimated = await estimateScopes(prompt);      // scope-estimator.ts; [] = no opinion → scp = standing
+const scp = estimated.length > 0
+  ? [...new Set([...standing.filter(s => estimated.includes(s)), ...liveTempScopes])]  // narrowing never strips a human's "Allow for this run"
+  : standing;
+database.runTokens.push({ jti, runId, agentId, ownerId, scp,
+  taints: carriedFromPreviousTokenSameThread,        // read on one turn, send on the next: still blocked
+  egressAllow: [],                                   // NOT carried across runs — per-run human approvals
+  estimated, withheld: standing.filter(s => !scp.includes(s)),
+  threadId: storedAgent.codexThreadId,               // backfilled on completion for a conversation's first run
+  issuedAt, expiresAt, revokedAt: null });
+// a scope the estimate needs but the agent lacks raises a card BEFORE the run starts:
+//   {source:"nl_intent", kind:"scope", action:"run:<scope>"} — one card per scope
+// then: token = await signAgent(config, { sub, own, run, jti, scp, expiresInSeconds })
+// pass { token, permissions: { ...storedAgent.permissions, tools: [...scp, ...withheld] } } into executeRun
+// (menu = scp ∪ withheld: a withheld tool stays visible so an attempt produces a deny + card as evidence;
+//  the gateway checks the token's scp, so offering it grants nothing)
 ```
 
 ## Ownership (B1 — `app.ts`)
@@ -51,17 +63,18 @@ All fields optional; defaults = `DEFAULT_PERMISSIONS` (today's behaviour, `tools
 
 | Route | Effect |
 |---|---|
-| `POST /api/agents/:id/kill` | Kill switch: every active RunToken for the agent → `revokedAt=now`; `permissions.tools=[]`; RunEvent `{action:"kill", decision:"deny", reason:"revoked-by-operator"}`. Container not killed (Stop does that). `200 { agent }` |
+| `POST /api/agents/:id/kill` | Kill switch: every active RunToken for the agent → `revokedAt=now`; `permissions.tools=[]` **and** `tempScopes=[]` (a leftover "Allow for this run" scope would hand itself to the next run); the agent's **pending cards are denied** (a stale "Always allow" clicked later would undo the kill); RunEvent `{action:"kill", decision:"deny", reason:"revoked-by-operator"}` carrying the interrupted run's `runId` when exactly one run was live. Container not killed (Stop does that). No busy guard — the kill must work exactly when the agent is busy. `200 { agent }` |
+| `GET /api/runs/:id` | `200 { run, scopes: { active, withheld, estimated } }` — derived from the RunToken (never the row itself; it carries the `jti`). The UI's "N of M tools active this run" |
 
 ## Grants (B1 routes → Zeon's `grants.ts`)
 
 | Route | Body / Response |
 |---|---|
 | `GET /api/agents/:id/grants` | `200 { grants: PolicyGrant[] }` — `listGrants(store, id)` (grants to or from this agent) |
-| `POST /api/grants` | `{ fromAgent: id\|null, toAgent: id, resource:"workspace"\|"crm", actions:["read","write"], egress?:["internal","agent","external"] }` → `201 { grant }` via `createGrant(store, body, principal.sub)`. `400` cross-tenant, `403` not your agent |
+| `POST /api/grants` | `{ fromAgent: id\|null, toAgent: id, resource:"workspace"\|"crm", actions:["read","write"], egress?:["internal","agent","external"], trustContent?: boolean }` → `201 { grant }` via `createGrant(store, body, principal.sub)`. `404` unknown agent (unlogged) · `403` the recipient is not yours (audited) · `400` the source agent is another tenant's (audited — intra-tenant only). `fromAgent` is required and nullable (`null` = the owner's own CRM), not optional |
 | `POST /api/grants/:id/revoke` | `200 { grant }` via `revokeGrant(store, id, principal.sub)`. Sets `revokedAt`; the grant's taints on every RunToken → `egress: []` |
 
-`PolicyGrant`: `{ id, fromOwner, fromAgent, toAgent, resource, actions, egress, createdAt, expiresAt, revokedAt }`.
+`PolicyGrant`: `{ id, fromOwner, fromAgent, toAgent, resource, actions, egress, trustContent, createdAt, expiresAt, revokedAt }`. `trustContent` (default `false`) says whether content read under the grant may be *believed* — an untrusted taint blocks outbound actions (integrity) until a human approves.
 Grants are checked **on every gateway call** (`findLiveGrant`) — never cached.
 
 ## Approvals / Access Request Cards (B1 routes → Zeon's `approvals.ts`)
@@ -69,17 +82,19 @@ Grants are checked **on every gateway call** (`findLiveGrant`) — never cached.
 | Route | Body / Response |
 |---|---|
 | `GET /api/approvals` | `200 { approvals: ApprovalRequest[] }` — caller's tenant, newest first (`listApprovals(store, principal.sub)`). F polls every 2 s |
-| `POST /api/approvals/:id/decide` | `{ decision: "allow_run" \| "allow_always" \| "deny" }` → `200 { approval }` via `decideApproval(store, id, decision, principal.sub)`. `409` already decided |
-| `POST /api/grants/parse` (stretch) | `{ text }` → `201 { approval }` with `source:"nl_intent"`, `status:"pending"` |
+| `POST /api/approvals/:id/decide` | `{ decision: "allow_run" \| "allow_always" \| "deny", trustContent?: boolean }` → `200 { approval }` via `decideApproval(id, decision, principal.sub, { trustContent })`. `trustContent` (grant cards only, default `false`) marks the created grant's content believable. `409` already decided, and `409` for `allow_run` on an nl_intent grant card (no run window to expire against) |
+| `POST /api/grants/parse` (stretch) | `{ text }` → `201 { approval }` with `source:"nl_intent"`, `status:"pending"` · `200 { approval }` when a byte-identical card is already pending (dedupe — nothing created) · `404` you have no agent by that name (names resolve inside the caller's tenant only; unlogged) · `422` unparseable. Workspace grants only, exactly one action |
 
-`ApprovalRequest`: `{ id, source:"live_deny"|"nl_intent", kind:"scope"|"grant"|"declassify", agentId, ownerId, runId, jti, resource, action, scope, grant, reason, status:"pending"|"allow_run"|"allow_always"|"deny", createdAt, decidedAt, decidedBy }`.
+`ApprovalRequest`: `{ id, source:"live_deny"|"nl_intent", kind:"scope"|"grant"|"declassify", agentId, ownerId, runId, jti, resource, action, scope, grant, reason, risk, evidence, status:"pending"|"allow_run"|"allow_always"|"deny", createdAt, decidedAt, decidedBy }`.
+`risk` (`"routine"|"elevated"|"critical"`) and `evidence` (`{userAsked, attempting, outsideTaskScope, untrustedOrigin, classifiedOrigin}`) are computed server-side — `critical` is only ever the injection signature (outside the task estimate ∧ untrusted content held ∧ outward destination). The UI renders them, never derives them.
+A declassify card's `reason` prefix names which check denied: `grant:<id>` (confidentiality) or `integrity:<id>` (untrusted content held).
 
 Button semantics (D8):
-- **Allow for this run** (`allow_run`): `scope` → current RunToken.scp widened **and** `agent.tempScopes += {scope, expiresAt: token.expiresAt}` so the follow-up message's new run still has it · `grant` → PolicyGrant with `expiresAt = token.expiresAt` · `declassify` → the run's taint for that grant gains the destination class.
-- **Always allow** (`allow_always`): `scope` → `agent.permissions.tools` · `grant` → permanent PolicyGrant · `declassify` → grant.egress widened.
+- **Allow for this run** (`allow_run`): `scope` → current RunToken.scp widened **and** `agent.tempScopes += {scope, expiresAt: token.expiresAt}` so the follow-up message's new run still has it · `grant` → PolicyGrant with `expiresAt = token.expiresAt` · `declassify` → `RunToken.egressAllow += resource` — the **one destination** the human looked at (a URL, a `"<name>/workspace"`), never the whole class, for both `grant:` and `integrity:` cards.
+- **Always allow** (`allow_always`): `scope` → `agent.permissions.tools` · `grant` → permanent PolicyGrant (with `trustContent` if ticked) · `declassify` `grant:` → grant.egress widened (+ matching live taints, so the current run proceeds) · `declassify` `integrity:` → `grant.trustContent = true` + that grant's live taints marked trusted. On a card whose reason is `grant:self:crm` (the owner's own CRM, no standing grant yet) it **creates** the tenant-level CRM grant (`fromAgent: null`) with the approved destination in its egress.
 - **Deny**: status only. All three write a RunEvent `{kind:"approval"}`.
 
-Cards are created **by the gateway on deny** — one pending card per `(agentId, kind, resource, action)`. No pattern cards (D11).
+Cards are created by the gateway on deny, by `sendMessage` at mint (`action:"run:<scope>"` for a scope the task needs but the agent lacks), and by `POST /api/grants/parse` — one pending card per `(agentId, kind, resource, action)`. No pattern cards (D11).
 
 ## Events / timeline (B3 `appendEvent` + B1 route)
 
@@ -89,7 +104,8 @@ Cards are created **by the gateway on deny** — one pending card per `(agentId,
 | `GET /api/agents/:id/events?filter=…&limit=200` | same shape, across runs (for the Scene 6 timeline) |
 
 `RunEvent`: `{ id, runId, agentId, ownerId, at, kind, action, resource, decision:"allow"|"deny"|"pending"|null, reason, detail }` — the row reads **human (ownerId) → agent → action → resource → outcome (decision/reason)**. `detail` is always passed through `redact()` (`audit.ts`; B3's `redact.ts` may replace via `setRedactor`).
-Gateway `reason` values: `no-token, bad-token, unknown-token, revoked, expired, scope, no-grant, cross-tenant, unknown-agent, unknown-tool, path-escape, ifc, error`.
+Gateway `reason` values: `no-token, bad-token, unknown-token, revoked, expired, scope, no-grant, cross-tenant, unknown-agent, unknown-tool, path-escape, ifc, integrity, error`.
+A run whose final output was screened writes one `{kind:"gateway", action:"output", resource:"chat", decision:"deny"}` row (`reason` = the verdict, `detail` = `{level, origin}`, never the output itself) — deny rows only, the one deviation from the every-branch rule.
 
 ## Gateway (Zeon — `gateway.ts`, MCP streamable HTTP)
 
@@ -100,11 +116,11 @@ Tools (all five always listed; enforcement on call):
 
 | Tool | Args | Scope | Resource / egress |
 |---|---|---|---|
-| `workspace_read` | `{ agent, path }` | `workspace:read` | own workspace, or another agent's with a live grant (adds a **taint**) |
-| `workspace_write` | `{ agent, path, body }` | `workspace:write` | own = `internal`; another agent's = `agent` (grant + taint check) |
-| `crm_read` | `{ customer? }` | `crm:read` | own tenant's `crm_records` via `withOwner(ownerId, agentId)` (RLS) |
-| `crm_write` | `{ customer, note }` | `crm:write` | `internal`; upsert on `(owner_id, customer)` |
-| `webhook_send` | `{ url, body }` | `webhook:send` | `external` — taint check, then B2's sink |
+| `workspace_read` | `{ agent, path }` | `workspace:read` | own workspace (no taint; secret-shaped content is fingerprinted for the output screen), or another agent's with a live grant (adds a **taint**, `trust` from `grant.trustContent`) |
+| `workspace_write` | `{ agent, path, body }` | `workspace:write` | own = `internal`, not outbound; another agent's = `agent` (grant + egress + integrity check) |
+| `crm_read` | `{ customer? }` | `crm:read` | own tenant's `crm_records` via `withOwner(ownerId, agentId)` (RLS). Adds a **taint** `{origin:"<owner>/crm", trust:"trusted"}` — egress from a standing tenant-level CRM grant (`fromAgent:null`) if one exists, else `["internal"]` |
+| `crm_write` | `{ customer, note }` | `crm:write` | `internal`, outbound (egress + integrity checked); upsert on `(owner_id, customer)` |
+| `webhook_send` | `{ url, body }` | `webhook:send` | `external` — egressAllow short-circuit, then egress + integrity check, then B2's sink |
 
 Denied calls return `isError:true` with text `DENIED (<reason>): <message>. An Access Request Card is pending operator approval — tell the user, then retry after they approve.`
 
@@ -122,7 +138,8 @@ Already mounted in `index.ts` (Zeon). **B3:** add `withOwner` to that call when 
 -c mcp_servers.launchpad.http_headers={Authorization="Bearer <token>"}
 -c mcp_servers.launchpad.enabled_tools=[<tool names for permissions.tools>]      # menu only; gateway enforces
 ```
-Verified 2026-08-26: codex 0.144.6 sends the header on `initialize`. Drop `--env ARK_API_KEY` only when `LLM_PROXY_ENABLED`.
+`permissions.tools` here is the runner projection `scp ∪ withheld` (see Minting above), not the agent's standing tools.
+Codex is pinned to `0.100.0` (verified 2026-08-29): `0.130.0`/`0.144.6` serialize the MCP server into the Ark Responses request as `{type:"namespace"}`, which Ark rejects (`unknown tool type: namespace`) — the model would never see any tool. `0.100.0` emits `{type:"function"}`, sends the configured `http_headers` agent JWT, and honors `enabled_tools`; don't bump without a live Ark round-trip proving all three. Drop `--env ARK_API_KEY` only when `LLM_PROXY_ENABLED`.
 `parseCodexEventLine` calls `request.onEvent({ runId, agentId, kind:"command"|"file_change"|"mcp_call", action, resource, decision:null, reason:null, detail })`.
 
 ## Data (B3 — `db.ts`, `migrations/001_init.sql`)

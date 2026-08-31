@@ -595,7 +595,7 @@ export class AgentService {
   /**
    * The agent timeline, across runs. It keys on `agentId` rather than on the
    * agent's runs on purpose: a cross-tenant denial names the agent but no run
-   * (`runId: null`, docs/SEAMS.md), so it can only ever surface here.
+   * (`runId: null`), so it can only ever surface here.
    */
   getAgentEvents(agentId: string, filter: EventFilter = "policy", limit = 200): RunEvent[] {
     this.getAgent(agentId);
@@ -669,7 +669,7 @@ export class AgentService {
       database.runs.push(run);
       database.messages.push(message);
       // tools ∪ live tempScopes, so an "Allow for this run" grant survives into
-      // the follow-up message's run (docs/SEAMS.md).
+      // the follow-up message's run.
       const standing = effectiveScopes(storedAgent, timestamp);
       // Narrowing is automatic and needs no human; widening never is. An empty
       // estimate (disabled, or the estimator could not answer) means the
@@ -707,7 +707,7 @@ export class AgentService {
       // This does *not* close laundering through storage — copying borrowed
       // content into the agent's own workspace, which never taints on read,
       // survives any run- or conversation-scoped label. Closing that needs the
-      // label on the file (docs/SEAMS.md).
+      // label on the file — not built.
       const previousToken = database.runTokens
         .filter((item) => item.agentId === agentId)
         .sort((left, right) => left.issuedAt.localeCompare(right.issuedAt))
@@ -795,7 +795,7 @@ export class AgentService {
    * which is today's behaviour, so a wrong estimate costs one round trip and
    * nothing else. Nothing here grants anything — a human answers the card.
    *
-   * **`action` carries the scope, and `docs/SEAMS.md` records why.**
+   * **`action` carries the scope, and here is why.**
    * `createCardOnDeny` dedupes on `(agentId, kind, resource, action)`, so a
    * literal `"run"` would collapse two missing scopes into one card and the
    * operator would never see the second decision. Keying on the scope also
@@ -816,7 +816,7 @@ export class AgentService {
         ownerId: agent.ownerId,
         // Unlike ticket 08's nl_intent cards these do name a run, so
         // `decideApproval`'s `allow_run` guard does not bite and both buttons
-        // work (docs/SEAMS.md).
+        // work.
         runId: run.id,
         jti: runToken.jti,
         resource: agent.name,
@@ -904,7 +904,7 @@ export class AgentService {
         // for a tool that is not there looks identical to a model that simply
         // chose not to call it, and there is no denial, no card, and no audit
         // row to show anyone. An attempt that is refused is evidence; an
-        // attempt that never happens is not (docs/SEAMS.md).
+        // attempt that never happens is not.
         permissions: {
           ...agentAtStart.permissions,
           tools: [...new Set([...runToken.scp, ...runToken.withheld])],
@@ -920,7 +920,7 @@ export class AgentService {
       if (screened.verdict !== "allow") {
         // Deny rows only — an allow row per run would be timeline noise. A
         // deliberate, documented deviation from the gateway's every-branch
-        // rule (docs/SEAMS.md). `detail` never carries the output itself.
+        // rule. `detail` never carries the output itself.
         await recordEvent(this.store, {
           runId: run.id,
           agentId: agentAtStart.id,

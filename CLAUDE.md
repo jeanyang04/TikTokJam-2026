@@ -1,8 +1,6 @@
 # CLAUDE.md — Agent Launchpad middleware (TikTok Tech Jam 2026)
 
-Read this fully before touching code. Then read `docs/PLAN.md` (design), `docs/TEAM.md` (who owns what), and skim `docs/DIAGRAMS.md`.
-
-**Read `docs/SEAMS.md` before adding an env var, signing or verifying a token, reading the caller's identity, or editing a file `docs/TEAM.md` assigns to someone else** — it records what already landed on the shared seams, and where the code deviates from `PLAN.md` on purpose. Add an entry there when you land something another owner builds on.
+Read this fully before touching code. Then read `docs/API.md` (the contract) and skim `docs/DIAGRAMS.md` (architecture — kept current with the code).
 
 ## What this repo is
 The RrankPyramid/CodeJam starter kit (React UI + Fastify control plane + Codex CLI running in a disposable Docker container per turn) plus our middleware for the **Identity & Authorization** track.
@@ -28,7 +26,7 @@ The RrankPyramid/CodeJam starter kit (React UI + Fastify control plane + Codex C
 4. **Secrets never enter the container or the logs.** No `ARK_API_KEY` in container env (behind `LLM_PROXY_ENABLED`); everything written to RunEvents passes `redact()`; never commit `.env`.
 5. **Enforcement lives in the backend/data layer, never the UI.** UI only exposes evidence.
 6. **Keep the JSON store** for agents/runs/tokens/grants/events. Postgres holds only the protected resource (`crm_records`).
-7. **Don't edit files you don't own** (see `docs/TEAM.md`). `types.ts` and `docs/API.md` are the shared contract — propose changes in chat, don't make them.
+7. `types.ts` and `docs/API.md` are the shared contract — propose changes in chat, don't make them.
 8. Smallest diff that proves the behaviour. No new UI libraries, no restyle, no speculative abstractions. One runnable test per new behaviour.
 
 ## Where things are
@@ -50,7 +48,7 @@ The RrankPyramid/CodeJam starter kit (React UI + Fastify control plane + Codex C
 ## Demo scenes (what the code must make true)
 1 deny-by-default → live card → Always allow → follow-up message succeeds · 2 prompt-injection exfil blocked by provenance (live once, `/demo/replay` fallback) · 3 NL grant card (stretch) · 4 cross-tenant: absent in list, explicit 403 · 5 revoke one grant mid-task, agent keeps working on the rest · 6 audit timeline (filter: policy only / all).
 
-Gateway transport is **MCP streamable HTTP** (verified: codex 0.144.6 sends `-c mcp_servers.*.http_headers`). Approval is never same-turn: tool returns DENIED, human decides, user sends the next message. Revoke = per grant; Kill switch = per agent identity; Stop = kit's process kill. No hosted instance — judges run locally.
+Gateway transport is **MCP streamable HTTP**. Codex is pinned to `0.100.0` — newer versions (0.130.0, 0.144.6) serialize MCP tools as `{type:"namespace"}`, which Ark rejects; see `docs/API.md` §Runtime projection before bumping. Approval is never same-turn: tool returns DENIED, human decides, user sends the next message. Revoke = per grant; Kill switch = per agent identity; Stop = kit's process kill. No hosted instance — judges run locally.
 
 ## Cut order if time is short
 NL parse → LLM proxy → IFC fingerprint layer (keep run-level taint). **IFC itself is committed.** Never cut: gateway, grants, cards, 403+audit, grant revoke, taints + egress block, timeline, tests.

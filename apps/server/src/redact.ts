@@ -1,7 +1,7 @@
 /**
  * Strips secrets from anything written to a RunEvent, before it's persisted
- * or shown in the timeline. Wired in via audit.ts's setRedactor() (see
- * docs/SEAMS.md's "Audit" section) — this file owns the pattern list and
+ * or shown in the timeline. Wired in via audit.ts's setRedactor() — this
+ * file owns the pattern list and
  * truncation rule; audit.ts's recordEvent() just calls whatever function is
  * installed here.
  */
