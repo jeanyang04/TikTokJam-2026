@@ -125,22 +125,9 @@ if [[ ! -d node_modules ]]; then
   npm ci
 fi
 
-if [[ -n "${LOCAL_POC_DATA_ROOT:-}" ]]; then
-  local_state_root="$LOCAL_POC_DATA_ROOT"
-  export APP_DATA_DIR="$local_state_root/data"
-  export AGENT_WORKSPACE_ROOT="$local_state_root/workspaces"
-  export CODEX_HOME="$local_state_root/codex-home"
-elif [[ "$(uname -s)" == "Darwin" ]]; then
-  local_state_root="${HOME}/.volc-agent-launchpad"
-  export APP_DATA_DIR="${APP_DATA_DIR:-$local_state_root/data}"
-  export AGENT_WORKSPACE_ROOT="${AGENT_WORKSPACE_ROOT:-$local_state_root/workspaces}"
-  export CODEX_HOME="${CODEX_HOME:-$local_state_root/codex-home}"
-else
-  local_state_root="$repo_dir/.local"
-  export APP_DATA_DIR="${APP_DATA_DIR:-$local_state_root/data}"
-  export AGENT_WORKSPACE_ROOT="${AGENT_WORKSPACE_ROOT:-$local_state_root/workspaces}"
-  export CODEX_HOME="${CODEX_HOME:-$local_state_root/codex-home}"
-fi
+# Shared with seed-local.sh so `npm run poc` and `npm run seed` always agree
+# on where the store lives.
+source "$repo_dir/scripts/local-state-env.sh"
 export RUNTIME_INSTANCE_ID="${RUNTIME_INSTANCE_ID:-local-$(id -u)-$(printf '%s' "$repo_dir" | cksum | awk '{print $1}')}"
 
 mkdir -p "$APP_DATA_DIR" "$AGENT_WORKSPACE_ROOT" "$CODEX_HOME"
