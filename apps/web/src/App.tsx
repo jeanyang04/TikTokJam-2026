@@ -16,11 +16,13 @@ import type {
   Message,
   PolicyGrant,
   RunEvent,
+  RunScopes,
   Scope,
   SystemInfo,
   WorkspaceFile,
   WorkspaceFileContent,
 } from "./types";
+import { pendingApprovalsForAgent } from "./approval-state";
 
 const starterPrompts = [
   "Create a small TypeScript CLI that prints a weather summary from sample JSON.",
@@ -277,9 +279,60 @@ function ApprovalCard({
   // is the only card where trusting the content is a question. Off by default:
   // borrowed content cannot drive an outbound action unless a human says so.
   const [trustContent, setTrustContent] = useState(false);
+  // Defaulted rather than destructured straight out: a card served by a server
+  // that predates these fields must render plainly, not blank the page. React
+  // unmounts the whole tree on a render throw, so "the field is missing" and
+  // "the app is gone" would otherwise be the same bug.
+  const risk = approval.risk ?? "routine";
+  const evidence = approval.evidence ?? {
+    userAsked: null,
+    attempting: approval.action + " on " + approval.resource,
+    outsideTaskScope: false,
+    untrustedOrigin: null,
+    classifiedOrigin: null,
+  };
+  const alarming = risk === "critical";
   return (
-    <article className="approval-card">
-      <h3>{agentName} requests access</h3>
+    <article className={"approval-card approval-risk-" + risk}>
+      <p className="approval-risk-label">
+        {risk === "critical"
+          ? "This does not match what you asked for"
+          : risk === "elevated"
+            ? "Worth a look"
+            : "Permission needed"}
+      </p>
+      <h3>
+        {alarming ? agentName + " is trying to do something you did not ask for" : agentName + " requests access"}
+      </h3>
+      {/* The alarm is the juxtaposition, not the colour: the user's own words
+          next to what the agent is reaching for. Everything here was computed
+          server-side — the UI is not deciding what looks suspicious. */}
+      {evidence.userAsked && (
+        <dl className="approval-evidence">
+          <div>
+            <dt>You asked</dt>
+            <dd>“{evidence.userAsked}”</dd>
+          </div>
+          <div>
+            <dt>The agent is trying to</dt>
+            <dd>{evidence.attempting}</dd>
+          </div>
+        </dl>
+      )}
+      {evidence.outsideTaskScope && (
+        <p className="approval-flag">This was not part of your request.</p>
+      )}
+      {evidence.untrustedOrigin && (
+        <p className="approval-flag">
+          It read content from <code>{evidence.untrustedOrigin}</code> first, which is outside your
+          trust boundary. That content may be what is asking for this.
+        </p>
+      )}
+      {evidence.classifiedOrigin && (
+        <p className="approval-flag">
+          The data involved originates from <code>{evidence.classifiedOrigin}</code>.
+        </p>
+      )}
       <p className="approval-summary">
         <strong>{approval.action}</strong> → <code>{approval.resource}</code>
       </p>
@@ -317,14 +370,25 @@ function ApprovalCard({
           <Spinner /> Saving decision…
         </div>
       )}
-      <div className="approval-actions">
-        <button className="button approval-deny-button" disabled={disabled} onClick={() => onDecide("deny", false)}>
+      {/* On an alarming card Deny leads and the allow paths go quiet. A card
+          whose default action is "Allow" is how automation bias gets its way
+          (OWASP ASI09), and these are exactly the cards where that matters. */}
+      <div className={"approval-actions" + (alarming ? " approval-actions-alarming" : "")}>
+        <button
+          className={"button " + (alarming ? "button-danger" : "approval-deny-button")}
+          disabled={disabled}
+          onClick={() => onDecide("deny", false)}
+        >
           Deny
         </button>
         <button className="button button-ghost" disabled={disabled} onClick={() => onDecide("allow_run", trustContent)}>
           Allow for this run
         </button>
-        <button className="button button-primary" disabled={disabled} onClick={() => onDecide("allow_always", trustContent)}>
+        <button
+          className={"button " + (alarming ? "button-ghost" : "button-primary")}
+          disabled={disabled}
+          onClick={() => onDecide("allow_always", trustContent)}
+        >
           Always allow
         </button>
       </div>
@@ -503,6 +567,9 @@ export default function App() {
   const [form, setForm] = useState(newAgentForm);
   const [prompt, setPrompt] = useState("");
   const [activeRun, setActiveRun] = useState<AgentRun | null>(null);
+  // What this run was actually allowed to do. Shown even after it finishes:
+  // the point of narrowing is invisible unless you can point at it afterwards.
+  const [activeRunScopes, setActiveRunScopes] = useState<RunScopes | null>(null);
   const [approvals, setApprovals] = useState<ApprovalRequest[]>([]);
   const [approvalsLoading, setApprovalsLoading] = useState(false);
   const [decidingApprovalId, setDecidingApprovalId] = useState<string | null>(null);
@@ -572,8 +639,8 @@ export default function App() {
   // Scoped to the agent actually on screen — a request for a different
   // agent must never surface here (that's what the toast is for).
   const selectedAgentPendingApprovals = useMemo(
-    () => pendingApprovals.filter((approval) => approval.agentId === selected?.id),
-    [pendingApprovals, selected],
+    () => pendingApprovalsForAgent(pendingApprovals, selected?.id ?? null),
+    [pendingApprovals, selected?.id],
   );
   const visibleModalApprovals = useMemo(
     () =>
@@ -588,26 +655,10 @@ export default function App() {
     () => grants.filter((grant) => grantState(grant) === "active").length,
     [grants],
   );
-  const latestBlockedEvent = useMemo(() => {
-    if (!activeRun) return null;
-    const policyEvents = events.filter(
-      (event) =>
-        event.runId === activeRun.id &&
-        ["gateway", "approval", "grant"].includes(event.kind),
-    );
-    const latest = policyEvents.at(-1) ?? null;
-    return latest?.decision === "deny" ? latest : null;
-  }, [activeRun, events]);
-  const blockedEventHasCard = useMemo(
-    () =>
-      latestBlockedEvent !== null &&
-      pendingApprovals.some(
-        (approval) =>
-          approval.agentId === latestBlockedEvent.agentId &&
-          approval.runId === latestBlockedEvent.runId,
-      ),
-    [latestBlockedEvent, pendingApprovals],
-  );
+  // A blocked callout represents unresolved work, not whichever policy event
+  // happened most recently. Keep it stable while its Access Request Card is
+  // pending; unrelated allowed calls and event polling must not hide it.
+  const blockedApproval = selectedAgentPendingApprovals[0] ?? null;
   const isProcessing = useMemo(
     () =>
       (activeRun != null && ["queued", "running"].includes(activeRun.status)) ||
@@ -1323,6 +1374,7 @@ export default function App() {
           selectedIdRef.current === agentId
         ) {
           setActiveRun(result.run);
+          setActiveRunScopes(result.scopes);
         }
         if (!["queued", "running"].includes(result.run.status)) {
           await Promise.all([
@@ -2050,18 +2102,21 @@ export default function App() {
               </div>
             )}
 
-            {latestBlockedEvent && (
+            {blockedApproval && (
               <aside className="policy-blocked-callout" role="alert">
                 <div className="policy-blocked-icon">!</div>
                 <div>
                   <strong>Action blocked by policy</strong>
                   <p>
-                    {selected.name} could not {formatEventLabel(latestBlockedEvent.action)} → {latestBlockedEvent.resource}.
-                    {latestBlockedEvent.reason ? " Reason: " + latestBlockedEvent.reason + "." : ""}
+                    {selected.name} could not {formatEventLabel(blockedApproval.action)} → {blockedApproval.resource}.
+                    {blockedApproval.reason ? " Reason: " + blockedApproval.reason + "." : ""}
                   </p>
-                  {blockedEventHasCard && (
-                    <span>An Access Request Card is pending.</span>
-                  )}
+                  <span>
+                    An Access Request Card is pending.
+                    {selectedAgentPendingApprovals.length > 1
+                      ? " " + selectedAgentPendingApprovals.length + " requests need a decision."
+                      : ""}
+                  </span>
                 </div>
               </aside>
             )}
@@ -2108,6 +2163,36 @@ export default function App() {
                         <div className="message-body">{message.content}</div>
                       </article>
                     ))
+                  )}
+                  {activeRunScopes && (activeRunScopes.withheld ?? []).length > 0 && (
+                    <article className="run-scopes">
+                      <div className="run-scopes-head">
+                        <strong>
+                          {activeRunScopes.active.length} of{" "}
+                          {activeRunScopes.active.length + (activeRunScopes.withheld ?? []).length} tools
+                          active this run
+                        </strong>
+                        <span>narrowed to what this task needs</span>
+                      </div>
+                      <div className="run-scopes-lists">
+                        <div>
+                          <span className="run-scopes-label">Active</span>
+                          {activeRunScopes.active.map((scope) => (
+                            <code key={scope} className="scope-chip scope-chip-active">{scope}</code>
+                          ))}
+                        </div>
+                        <div>
+                          <span className="run-scopes-label">Withheld</span>
+                          {(activeRunScopes.withheld ?? []).map((scope) => (
+                            <code key={scope} className="scope-chip scope-chip-withheld">{scope}</code>
+                          ))}
+                        </div>
+                      </div>
+                      <p className="run-scopes-note">
+                        Withheld tools are unavailable for this run only. {selected.name}&apos;s
+                        standing permissions are unchanged.
+                      </p>
+                    </article>
                   )}
                   {activeRun && ["queued", "running"].includes(activeRun.status) && (
                     <article className="message message-assistant thinking">

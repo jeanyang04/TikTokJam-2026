@@ -14,11 +14,12 @@
     "dev": "concurrently -n server,web -c cyan,magenta \"npm run dev -w @launchpad/server\" \"npm run dev -w @launchpad/web\"",
     "build": "npm run build -w @launchpad/web && npm run build -w @launchpad/server",
     "typecheck": "npm run typecheck --workspaces --if-present",
-    "test": "npm run test -w @launchpad/server",
+    "test": "npm run test --workspaces --if-present",
     "check": "npm run typecheck && npm run test && npm run build",
     "check:db": "docker compose up -d postgres && DATABASE_URL_ADMIN=${DATABASE_URL_ADMIN:-postgres://app_admin:launchpad@127.0.0.1:5433/launchpad} DATABASE_URL_AGENT=${DATABASE_URL_AGENT:-postgres://app_agent:launchpad@127.0.0.1:5433/launchpad} npm run test -w @launchpad/server -- src/rls.test.ts src/crm-gateway.test.ts",
     "poc": "./scripts/start-local-poc.sh",
     "seed": "npm run seed -w @launchpad/server",
+    "seed:reset": "npm run seed -w @launchpad/server -- --reset",
     "start": "npm run start -w @launchpad/server"
   },
   "devDependencies": {

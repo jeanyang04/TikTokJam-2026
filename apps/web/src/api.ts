@@ -8,6 +8,7 @@ import type {
   Message,
   PolicyGrant,
   RunEvent,
+  RunScopes,
   SystemInfo,
   WorkspaceFile,
   WorkspaceFileContent,
@@ -159,5 +160,5 @@ export const api = {
         body: JSON.stringify({ content }),
       },
     ),
-  run: (id: string) => request<{ run: AgentRun }>("/api/runs/" + id),
+  run: (id: string) => request<{ run: AgentRun; scopes: RunScopes }>("/api/runs/" + id),
 };

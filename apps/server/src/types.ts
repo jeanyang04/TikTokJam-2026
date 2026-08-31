@@ -94,6 +94,23 @@ export interface RunToken {
    */
   egressAllow: string[];
   /**
+   * What the *task* looked like it needed, from the user's message alone
+   * (`scope-estimator.ts`). `scp` is this intersected with what the agent
+   * holds. Kept because it is the baseline a card is judged against: a tool
+   * the agent asks for that is not in here is a tool the user's own request
+   * never implied. Empty means the estimator had no opinion and `scp` is the
+   * agent's standing set unchanged. Rows persisted before this field default
+   * to `[]` on load.
+   */
+  estimated: Scope[];
+  /**
+   * Standing scopes this run did *not* get, so the UI can say "1 of 3 tools
+   * active" after the fact. Not recomputable later — the agent's permissions
+   * may have changed since — so it is recorded at mint. Rows persisted before
+   * this field default to `[]` on load.
+   */
+  withheld: Scope[];
+  /**
    * The agent's Codex thread as of this mint, or null for a run that predates
    * the thread it went on to create. Taints carry forward from the previous
    * run only while this is the same conversation — the model's memory of what
@@ -132,6 +149,36 @@ export type ApprovalKind = "scope" | "grant" | "declassify";
 export type ApprovalDecision = "allow_run" | "allow_always" | "deny";
 export type ApprovalStatus = "pending" | ApprovalDecision;
 
+/**
+ * How alarming this card should be, computed server-side from what the run
+ * actually did — never styling the UI picks for itself (CLAUDE.md rule 5).
+ *
+ * `critical` is the prompt-injection signature and nothing else: the agent is
+ * reaching for something the user's own request never implied, while holding
+ * content from outside the trust boundary, and pointing it outward. Rare by
+ * construction, which is the point — a card that always looks alarming is a
+ * card nobody reads (OWASP ASI09, automation bias).
+ */
+export type ApprovalRisk = "routine" | "elevated" | "critical";
+
+/**
+ * What makes the card believable, as facts rather than adjectives. The alarm
+ * is the juxtaposition of `userAsked` and `attempting`; the origins name what
+ * changed the agent's behaviour.
+ */
+export interface ApprovalEvidence {
+  /** The message that started the run, truncated. Null if the run is gone. */
+  userAsked: string | null;
+  /** What the agent is trying to do, in one human phrase. */
+  attempting: string;
+  /** The request is outside what the user's own message implied. */
+  outsideTaskScope: boolean;
+  /** Origin of untrusted content the run is holding, if any. */
+  untrustedOrigin: string | null;
+  /** Origin of classified content blocked from this destination, if any. */
+  classifiedOrigin: string | null;
+}
+
 export interface ApprovalRequest {
   id: string;
   source: ApprovalSource;
@@ -145,6 +192,10 @@ export interface ApprovalRequest {
   scope: Scope | null; // scope to add for kind=scope
   grant: Pick<PolicyGrant, "fromOwner" | "fromAgent" | "toAgent" | "resource" | "actions" | "egress"> | null;
   reason: string;
+  /** Rows persisted before this field default to "routine" on load. */
+  risk: ApprovalRisk;
+  /** Rows persisted before this field get an empty-handed default on load. */
+  evidence: ApprovalEvidence;
   status: ApprovalStatus;
   createdAt: string;
   decidedAt: string | null;

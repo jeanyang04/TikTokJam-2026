@@ -262,7 +262,9 @@ export async function createApp(
       callerOf(request),
       "GET /api/runs/:id",
     );
-    return { run };
+    // Ownership is settled above, so the scope breakdown rides along rather
+    // than needing a second round trip: the UI shows it in the run header.
+    return { run, scopes: service.getRunScopes(id) };
   });
 
   app.get("/api/agents/:id/grants", async (request) => {

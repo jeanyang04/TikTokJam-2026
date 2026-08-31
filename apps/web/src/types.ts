@@ -83,10 +83,31 @@ export interface ApprovalRequest {
     "fromOwner" | "fromAgent" | "toAgent" | "resource" | "actions" | "egress"
   > | null;
   reason: string;
+  /** Optional on the wire: a server older than these fields omits them. */
+  risk?: ApprovalRisk;
+  evidence?: ApprovalEvidence;
   status: ApprovalStatus;
   createdAt: string;
   decidedAt: string | null;
   decidedBy: string | null;
+}
+
+/** Computed server-side. The UI renders this judgement, it never makes one. */
+export type ApprovalRisk = "routine" | "elevated" | "critical";
+
+export interface ApprovalEvidence {
+  userAsked: string | null;
+  attempting: string;
+  outsideTaskScope: boolean;
+  untrustedOrigin: string | null;
+  classifiedOrigin: string | null;
+}
+
+/** What one run was allowed to do, against what the agent holds standing. */
+export interface RunScopes {
+  active: Scope[];
+  withheld?: Scope[];
+  estimated?: Scope[];
 }
 
 export interface Agent {

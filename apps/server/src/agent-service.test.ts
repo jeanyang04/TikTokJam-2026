@@ -368,11 +368,61 @@ describe("Task-scoped permissions", () => {
     expect(service.getAgent(agent.id).permissions.tools).toEqual(ALL_FIVE);
   });
 
-  it("reaches the runner, so the tool is off the model's menu too", async () => {
+  it("records what was withheld, so the run can say 1 of 5 afterwards", async () => {
+    // Not recomputable later: the agent's standing permissions may change
+    // between the run and someone looking at it, so it is written at mint.
+    const { service, store } = await withEstimator(async () => ["workspace:read"]);
+    const agent = await service.createAgent({ name: "Researcher", permissions: { tools: ALL_FIVE } });
+    const { run } = await service.sendMessage(agent.id, "summarise the notes");
+    await expect.poll(() => service.getRun(run.id).status).toBe("completed");
+
+    expect(service.getRunScopes(run.id)).toEqual({
+      active: ["workspace:read"],
+      withheld: ["workspace:write", "crm:read", "crm:write", "webhook:send"],
+      estimated: ["workspace:read"],
+    });
+    // The token itself never leaves the server; only this shape does.
+    expect(store.snapshot().runTokens[0]?.withheld).toHaveLength(4);
+  });
+
+  it("withholds nothing when the estimator had no opinion", async () => {
+    const { service } = await withEstimator(async () => []);
+    const agent = await service.createAgent({ name: "Researcher", permissions: { tools: ALL_FIVE } });
+    const { run } = await service.sendMessage(agent.id, "carry on");
+    await expect.poll(() => service.getRun(run.id).status).toBe("completed");
+
+    expect(service.getRunScopes(run.id).withheld).toEqual([]);
+    expect(service.getRunScopes(run.id).active).toEqual(ALL_FIVE);
+  });
+
+  it("leaves withheld tools on the model's menu, so reaching for one is visible", async () => {
+    // Deliberately *not* hidden. Enforcement is the token's `scp` at the
+    // gateway, so offering a withheld tool grants nothing — the call is denied
+    // and raises a card. Hiding it makes the narrowing invisible instead: an
+    // injection reaching for a tool that is not there looks exactly like a
+    // model that chose not to call it, and leaves no denial and no audit row.
     const runner = new CapturingRunner();
     const { service } = await withEstimator(async () => ["workspace:read"], runner);
     const agent = await service.createAgent({ name: "Researcher", permissions: { tools: ALL_FIVE } });
     const { run } = await service.sendMessage(agent.id, "summarise the notes");
+    await expect.poll(() => service.getRun(run.id).status).toBe("completed");
+
+    expect(runner.request?.permissions?.tools?.sort()).toEqual([...ALL_FIVE].sort());
+    // The token stays narrow, which is the half that actually decides.
+    expect(service.getRunScopes(run.id).active).toEqual(["workspace:read"]);
+  });
+
+  it("keeps a scope the agent never held off the menu entirely", async () => {
+    // The menu is `scp ∪ withheld`, both of which come from the token. A scope
+    // the agent does not hold is in neither, so narrowing can never hand the
+    // model something the operator never granted.
+    const runner = new CapturingRunner();
+    const { service } = await withEstimator(async () => ALL_FIVE, runner);
+    const agent = await service.createAgent({
+      name: "Researcher",
+      permissions: { tools: ["workspace:read"] },
+    });
+    const { run } = await service.sendMessage(agent.id, "do everything");
     await expect.poll(() => service.getRun(run.id).status).toBe("completed");
 
     expect(runner.request?.permissions?.tools).toEqual(["workspace:read"]);

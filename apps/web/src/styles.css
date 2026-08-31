@@ -3036,3 +3036,155 @@ textarea:focus {
     grid-template-columns: 1fr;
   }
 }
+
+/* ---- Card risk, and what a run was allowed to do ----
+   Risk is computed on the server; these rules only render it. Routine cards
+   deliberately look exactly as they always did: if every card carries a
+   warning, none of them do. */
+
+.approval-risk-label {
+  margin: 0 0 4px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.approval-risk-elevated {
+  padding-left: 12px;
+  border-left: 3px solid #d9a441;
+}
+
+.approval-risk-elevated .approval-risk-label {
+  color: #a97614;
+}
+
+.approval-risk-critical {
+  padding-left: 12px;
+  border-left: 3px solid var(--red);
+  background: #fdf4f4;
+}
+
+.approval-risk-critical .approval-risk-label {
+  color: var(--red);
+}
+
+.approval-risk-critical h3 {
+  color: var(--red);
+}
+
+/* The juxtaposition that carries the alarm: what was asked, what is happening. */
+.approval-evidence {
+  margin: 10px 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 13px;
+}
+
+.approval-evidence > div {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+}
+
+.approval-evidence dt {
+  flex: 0 0 auto;
+  min-width: 132px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.approval-evidence dd {
+  margin: 0;
+  min-width: 0;
+  color: var(--ink);
+  overflow-wrap: anywhere;
+}
+
+.approval-flag {
+  margin: 6px 0 0;
+  font-size: 13px;
+  color: var(--ink);
+}
+
+.approval-risk-critical .approval-flag {
+  color: #8f3b3b;
+}
+
+/* Deny leads on an alarming card; the allow paths go quiet. */
+.approval-actions-alarming {
+  flex-direction: row;
+}
+
+.run-scopes {
+  margin: 12px 0;
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--paper);
+}
+
+.run-scopes-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.run-scopes-head strong {
+  font-size: 13px;
+  color: var(--ink);
+}
+
+.run-scopes-head span {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.run-scopes-lists {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 10px;
+}
+
+.run-scopes-lists > div {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.run-scopes-label {
+  min-width: 64px;
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.scope-chip {
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 12px;
+}
+
+.scope-chip-active {
+  background: var(--purple-soft);
+  color: var(--purple-dark);
+}
+
+/* Struck through, not hidden: the tool exists, this run just cannot reach it. */
+.scope-chip-withheld {
+  background: #f0efe9;
+  color: var(--muted);
+  text-decoration: line-through;
+}
+
+.run-scopes-note {
+  margin: 10px 0 0;
+  font-size: 12px;
+  color: var(--muted);
+}
