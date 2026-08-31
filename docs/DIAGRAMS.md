@@ -384,5 +384,5 @@ flowchart LR
     style KEEP fill:#e8f5e9,stroke:#2e7d32
 ```
 
-Tool calls were already gated; the run's *final output* becomes a stored chat message and was the surface a hijacked agent could simply print to. Reads are classified `public < internal < confidential < secret` by channel + content detectors; only `secret` is withheld at the default threshold — the owner reading their own grant approved data in their own chat is the product working, but a stored chat message must never carry a credential.
+Tool calls were already gated; the run's *final output* becomes a stored chat message and was the surface a hijacked agent could simply print to. Reads are classified `public < internal < confidential < secret` by channel + content detectors; only `secret` is withheld at the default threshold, the owner reading their own grant approved data in their own chat is the product working, but a stored chat message must never carry a credential.
 
