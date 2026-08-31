@@ -17,8 +17,8 @@ export interface Db {
   agentPool: Pool;
   /**
    * Runs fn inside one transaction with app.owner_id/app.agent_id bound for
-   * Postgres's RLS policy to read. THE audited binding point (docs/PLAN.md
-   * D4): callers must pass the verified token's `own` (or a checked grant's
+   * Postgres's RLS policy to read. THE audited binding point (D4):
+   * callers must pass the verified token's `own` (or a checked grant's
    * `fromOwner`), never a request argument — this function has no way to
    * enforce that itself, it only guarantees the value it's given is what
    * reaches current_setting('app.owner_id').

@@ -2,7 +2,7 @@ export type AgentStatus = "ready" | "busy" | "stopped" | "error";
 export type RunStatus = "queued" | "running" | "completed" | "failed" | "cancelled";
 export type MessageRole = "user" | "assistant";
 
-// ---- Identity & Authorization middleware (see docs/PLAN.md §0, §3) ----
+// ---- Identity & Authorization middleware (see docs/DIAGRAMS.md) ----
 
 export type Scope =
   | "workspace:read"

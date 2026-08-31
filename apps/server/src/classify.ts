@@ -23,7 +23,7 @@ export const maxLevel = (a: SecurityLevel, b: SecurityLevel): SecurityLevel =>
 /**
  * The same four shapes audit.ts / redact.ts scrub, deliberately a separate
  * list: redaction scrubs the audit trail, classification flags live content.
- * Keep the two in sync when either grows a pattern (docs/SEAMS.md).
+ * Keep the two in sync when either grows a pattern.
  * No /g flags here — a global regex's lastIndex makes .test() stateful.
  */
 const SECRET_PATTERNS: readonly RegExp[] = [
