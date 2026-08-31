@@ -1,6 +1,6 @@
 # Agent Launchpad — Architecture Diagrams (Identity & Authorization track)
 
-Terms in force (all landed unless marked): grants as first-class objects (intra-tenant) · deny-triggered Access Request Card (sources: `live_deny` / `nl_intent`; buttons Allow for this run / Always allow / Deny; server-computed `risk` + `evidence`) · 403 + audit on cross-tenant, 404 for unknown IDs · grant-level revoke (token stays valid; revoked grant's taint → `egress: []`) · taint-tracked provenance on outbound tools · task-scoped tokens (`scp` narrowed to what the prompt implies) · security levels + trust labels · chat output screened as a third egress surface · **owner-only** RLS on `crm_records` · MCP streamable HTTP transport (Codex pinned to `0.100.0` — later versions serialize MCP tools as `type:"namespace"`, which Ark rejects).
+Terms in force (all landed unless marked): grants as first-class objects (intra-tenant) · deny-triggered Access Request Card (sources: `live_deny` / `nl_intent`; buttons Allow for this run / Always allow / Deny; server-computed `risk` + `evidence`) · 403 + audit on cross-tenant, 404 for unknown IDs · grant-level revoke (token stays valid; revoked grant's taint → `egress: []`) · taint-tracked provenance on outbound tools · task-scoped tokens (`scp` narrowed to what the prompt implies) · security levels + trust labels · chat output screened as a third egress surface · **owner-only** RLS on `crm_records` · MCP streamable HTTP transport (Codex pinned to `0.100.0`, later versions serialize MCP tools as `type:"namespace"`, which Ark rejects).
 
 Cast: **Jean** owns **Researcher** and **Writer**. **Alex** is a second tenant. Seeded scopes: Researcher holds `workspace:read` + `webhook:send` (so Scene 1's deny is a missing *grant*, and Scene 2 reaches the IFC check).
 
@@ -85,9 +85,9 @@ flowchart LR
 
 | Object | Answers | Lives in | Mutable during a run? |
 |---|---|---|---|
-| `Agent.permissions.tools` → `RunToken.scp` | which **tools** may this agent call — narrowed at mint to what the *task* implies (`scp = (tools ∪ live tempScopes) ∩ estimate`, live tempScopes always survive) | store | yes — "Allow for this run" writes `agent.tempScopes`, so the follow-up run keeps the scope |
+| `Agent.permissions.tools` → `RunToken.scp` | which **tools** may this agent call — narrowed at mint to what the *task* implies (`scp = (tools ∪ live tempScopes) ∩ estimate`, live tempScopes always survive) | store | yes — "Allow for this run" writes `agent.tempScopes`, so the follow up run keeps the scope |
 | `RunToken.estimated` / `withheld` | what the task looked like it needed / which standing scopes this run did **not** get | store | no — recorded at mint; `withheld` cannot be recomputed later |
-| `PolicyGrant{fromOwner, fromAgent, toAgent, resource, actions, egress, trustContent, revokedAt}` (intra-tenant only; `fromAgent: null` = the owner's own CRM) | whose **data** may this agent touch, where it may go, and whether it may be *believed* | store | yes — created by "Always allow" (or "for this run" with run expiry), killed by revoke |
+| `PolicyGrant{fromOwner, fromAgent, toAgent, resource, actions, egress, trustContent, revokedAt}` (intra tenant only; `fromAgent: null` = the owner's own CRM) | whose **data** may this agent touch, where it may go, and whether it may be *believed* | store | yes — created by "Always allow" (or "for this run" with run expiry), killed by revoke |
 | `RunToken.taints[]` (`Label{grantId, origin, egress, level, trust}`) | what data this run **holds** — grant reads, and the owner's own CRM | store | grows on every tainting read; carried forward across turns of the same Codex thread |
 | `RunToken.egressAllow[]` | concrete destinations (a URL, a `"<name>/workspace"`) a human approved for **this run** | store | grows on "Allow for this run" of a declassify card |
 
@@ -95,7 +95,7 @@ flowchart LR
 
 | Level | Question | Enforced by |
 |---|---|---|
-| Tenant ↔ tenant | Can Alex see or touch Jean's agents/data? | ownership preHandler → **403 + audit** (404 if the ID doesn't exist); owner-only RLS on `crm_records` (LOCK 2) |
+| Tenant ↔ tenant | Can Alex see or touch Jean's agents/data? | ownership preHandler → **403 + audit** (404 if the ID doesn't exist); owner only RLS on `crm_records` (LOCK 2) |
 | Agent ↔ agent, same tenant | Can Researcher read Writer's workspace? | `PolicyGrant` checked per call in gateway (LOCK 1) |
 | Data ↔ destination | Can Researcher send what it read to a webhook, another agent, or the chat? | taint/egress + integrity check on outbound tools; `screenOutput` on the run's final output (LOCK 1, IFC) |
 | Task ↔ tool | Can a planted instruction reach a tool the task never needed? | `scp` narrowed at mint; withheld tools stay on the model's menu but deny with a card (evidence, not access) |
@@ -240,7 +240,7 @@ flowchart LR
     style ONCE fill:#e8f5e9,stroke:#2e7d32
 ```
 
-The model (NL path) and the estimator **propose**; only a human click **grants**. `risk` is computed server-side from facts already in the pipeline — `critical` is only ever the three-way injection signature (outside the task estimate ∧ untrusted content held ∧ outward destination), so a critical card stays rare enough to be read; the UI inverts its button hierarchy on it (Deny leads) but never derives risk itself. A declassify card's `reason` prefix says which half denied: `grant:<id>` (confidentiality) or `integrity:<id>` — "Always allow" means different things for the two. Cards dedupe on `(agentId, kind, resource, action)`.
+The model (NL path) and the estimator **propose**; only a human click **grants**. `risk` is computed server side from facts already in the pipeline — `critical` is only ever the three-way injection signature (outside the task estimate ∧ untrusted content held ∧ outward destination), so a critical card stays rare enough to be read; the UI inverts its button hierarchy on it (Deny leads) but never derives risk itself. A declassify card's `reason` prefix says which half denied: `grant:<id>` (confidentiality) or `integrity:<id>` — "Always allow" means different things for the two. Cards dedupe on `(agentId, kind, resource, action)`.
 
 ---
 
@@ -384,5 +384,5 @@ flowchart LR
     style KEEP fill:#e8f5e9,stroke:#2e7d32
 ```
 
-Tool calls were already gated; the run's *final output* becomes a stored chat message and was the surface a hijacked agent could simply print to. Reads are classified `public < internal < confidential < secret` by channel + content detectors; only `secret` is withheld at the default threshold — the owner reading their own grant-approved data in their own chat is the product working, but a stored chat message must never carry a credential.
+Tool calls were already gated; the run's *final output* becomes a stored chat message and was the surface a hijacked agent could simply print to. Reads are classified `public < internal < confidential < secret` by channel + content detectors; only `secret` is withheld at the default threshold — the owner reading their own grant approved data in their own chat is the product working, but a stored chat message must never carry a credential.
 
