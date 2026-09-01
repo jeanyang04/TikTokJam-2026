@@ -1,4 +1,4 @@
-# Volc Agent Launchpad
+# Agent Launchpad
 
 An Agent platform for three-day middleware hackathons, built out with an
 Identity & Authorization middleware layer: agents get scoped, revocable
@@ -85,8 +85,8 @@ Runtime image.
 ### 2. Clone the repository
 
 ```bash
-git clone <repository-url> volc-agent-launchpad
-cd volc-agent-launchpad
+git clone <repository-url> agent-launchpad
+cd agent-launchpad
 ```
 
 Skip this step when already working from the repository root.
@@ -320,7 +320,7 @@ gateway code.
 
 **Limitations.** Owner-level tenancy, not hardened container isolation. Run-level taint over-blocks (any external egress after a grant-scoped read) — the declassify card is the escape hatch. The model still *sees* grant-scoped data; what we guarantee is it can't *move* it past the grant's scope through any tool we control. Approval is never same-turn: the tool returns DENIED, the human decides, the next message succeeds. Next steps: cross-tenant grants with from-owner approval; agent→agent delegation with attenuated scopes.
 
-Design: `docs/PLAN.md` · diagrams: `docs/DIAGRAMS.md` · routes: `docs/API.md` · team: `docs/TEAM.md`.
+Design: `docs/PLAN.md` · diagrams: `docs/DIAGRAMS.md` · routes: `docs/API.md` .
 
 ### Reproduce the demo scenarios
 

@@ -1,6 +1,6 @@
 # Architecture
 
-Volc Agent Launchpad is a single-node control plane for hackathon use.
+Agent Launchpad is a single-node control plane for hackathon use.
 
 ```mermaid
 flowchart LR
