@@ -337,8 +337,6 @@ gateway code.
 
 **Limitations.** Owner-level tenancy, not hardened container isolation. Run-level taint over-blocks (any external egress after a grant-scoped read) — the declassify card is the escape hatch. The model still *sees* grant-scoped data; what we guarantee is it can't *move* it past the grant's scope through any tool we control. Approval is never same-turn: the tool returns DENIED, the human decides, the next message succeeds. Next steps: cross-tenant grants with from-owner approval; agent→agent delegation with attenuated scopes.
 
-Design: `docs/PLAN.md` · diagrams: `docs/DIAGRAMS.md` · routes: `docs/API.md` · team: `docs/TEAM.md`.
-
 ### Reproduce the demo scenarios
 
 Everything below runs against the one instance from [Local browser SOP](#local-browser-sop) — no
