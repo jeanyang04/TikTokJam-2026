@@ -307,6 +307,23 @@ gateway code.
 
 **Solution — agents get capabilities, not credentials.** Every run gets its own scoped, short-lived, revocable identity (an agent JWT backed by an authoritative `RunToken` row). Every tool call passes one gateway (LOCK 1: `apps/server/src/gateway.ts`) that checks *who → which tool → whose data (PolicyGrant) → where may it go (taint/IFC)* and writes an audit row either way. Tenant data lives behind Postgres row-level security (LOCK 2), independent of gateway code. A human confirms every grant through an Access Request Card; grants can be revoked mid-run without stopping the agent.
 
+| Feature | What it does |
+|---|---|
+| Scoped agent identity | Every run gets its own Agent JWT (`sub`, `own`, `run`, `jti`, `scp`, `exp`) + a `RunToken` row — revocable, not just a snapshot |
+| Gateway enforcement (LOCK 1) | Every tool call hits `POST /mcp`, checked live against the `RunToken` — who / which tool / whose data / where it can go |
+| No token caching | Gateway re-reads `RunToken`/`PolicyGrant` on every call, so revoke-mid-run actually works |
+| Access Request Card | Human-in-the-loop approval UI — Allow for this run / Always allow / Deny, triggered by live deny or NL intent |
+| PolicyGrant (data ownership) | Governs whose data an agent may touch and which actions — intra-tenant only |
+| Egress control (IFC / taints) | Tool calls that read grant-scoped data get tainted; outbound tools must satisfy every taint's egress class (`internal`/`agent`/`external`) |
+| Cross-tenant isolation (LOCK 2) | Postgres RLS on `crm_records`, owner-only — cross-tenant read = 403 + audit, unknown ID = 404 |
+| Row-level security binding | `withOwner()` binds `app.owner_id` from the verified token only, never from a tool argument |
+| Audit trail (RunEvent) | Every gateway decision (allow/deny) logged as `human → agent → action → resource → outcome` |
+| Credential redaction | All RunEvent data passes `redact()` before storage — secrets never hit logs |
+| Secret isolation | No API keys enter the container env (e.g. `ARK_API_KEY` gated behind `LLM_PROXY_ENABLED`) |
+| Grant revocation mid-task | Revoking one grant doesn't kill the run — agent keeps working on unaffected scopes |
+| Kill switch | Per-agent-identity hard stop, distinct from per-grant revoke |
+| Audit timeline UI | Filterable view (policy-only / all) over the RunEvent log |
+
 | Boundary | Decides | Crosses | On failure |
 |---|---|---|---|
 | Browser → API | human JWT + ownership hook | human JWT | 401; cross-tenant → 403 + audit; unknown id → 404 |
