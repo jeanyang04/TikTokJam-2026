@@ -1,6 +1,6 @@
 # Agent Launchpad — Architecture Diagrams (Identity & Authorization track)
 
-Terms in force (all landed unless marked): grants as first-class objects (intra-tenant) · deny-triggered Access Request Card (sources: `live_deny` / `nl_intent`; buttons Allow for this run / Always allow / Deny; server-computed `risk` + `evidence`) · 403 + audit on cross-tenant, 404 for unknown IDs · grant-level revoke (token stays valid; revoked grant's taint → `egress: []`) · taint-tracked provenance on outbound tools · task-scoped tokens (`scp` narrowed to what the prompt implies) · security levels + trust labels · chat output screened as a third egress surface · **owner-only** RLS on `crm_records` · MCP streamable HTTP transport (Codex pinned to `0.100.0`, later versions serialize MCP tools as `type:"namespace"`, which Ark rejects).
+Terms used throughout: grants as first-class objects (intra-tenant) · deny-triggered Access Request Card (sources: `live_deny` / `nl_intent`; buttons Allow for this run / Always allow / Deny; server-computed `risk` + `evidence`) · 403 + audit on cross-tenant, 404 for unknown IDs · grant-level revoke (token stays valid; revoked grant's taint → `egress: []`) · taint-tracked provenance on outbound tools · task-scoped tokens (`scp` narrowed to what the prompt implies) · security levels + trust labels · chat output screened as a third egress surface · **owner-only** RLS on `crm_records` · MCP streamable HTTP transport (Codex pinned to `0.100.0`, later versions serialize MCP tools as `type:"namespace"`, which Ark rejects).
 
 Cast: **Jean** owns **Researcher** and **Writer**. **Alex** is a second tenant. Seeded scopes: Researcher holds `workspace:read` + `webhook:send` (so Scene 1's deny is a missing *grant*, and Scene 2 reaches the IFC check).
 
@@ -225,7 +225,7 @@ Not a missing permission: Researcher legitimately had `webhook:send`. The block 
 flowchart LR
     D["Gateway deny<br/>(scope / no-grant / ifc / integrity)"] -- "source: live_deny" --> CARD
     PRE["Mint-time narrowing<br/>task needs a scope the agent lacks<br/>action: run:&lt;scope&gt;, one card per scope"] -- "source: nl_intent, kind: scope" --> CARD
-    N["NL intent (stretch)<br/>'let Researcher read Writer's notes'<br/>Ark → zod + ownership re-check<br/>(grammar fallback)"] -- "source: nl_intent, kind: grant" --> CARD
+    N["NL intent<br/>'let Researcher read Writer's notes'<br/>Ark → zod + ownership re-check<br/>(grammar fallback)"] -- "source: nl_intent, kind: grant" --> CARD
 
     CARD["Access Request Card<br/>status: pending · risk: routine | elevated | critical<br/>evidence: userAsked vs attempting + origins<br/>Allow for this run · Always allow · Deny<br/>(+ 'trust content from this source' on grant cards)"]
 

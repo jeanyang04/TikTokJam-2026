@@ -14,3 +14,8 @@ coverage/
 deploy/volcengine/.terraform/
 deploy/volcengine/*.tfstate*
 deploy/volcengine/terraform.tfvars
+
+# Internal team-coordination notes, not part of the submission
+docs/PLAN.md
+docs/TEAM.md
+CLAUDE.md

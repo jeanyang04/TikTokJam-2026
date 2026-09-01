@@ -1,4 +1,4 @@
-# Volc Agent Launchpad
+# Agent Launchpad
 
 An Agent platform for three-day middleware hackathons, built out with an
 Identity & Authorization middleware layer: agents get scoped, revocable
@@ -85,8 +85,8 @@ Runtime image.
 ### 2. Clone the repository
 
 ```bash
-git clone <repository-url> volc-agent-launchpad
-cd volc-agent-launchpad
+git clone <repository-url> agent-launchpad
+cd agent-launchpad
 ```
 
 Skip this step when already working from the repository root.
